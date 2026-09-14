@@ -97,6 +97,7 @@ def interactive_rescale_and_approve_flux(
     outdir: Path,
     show: bool = True,
     interactive: bool = True,
+    output_suffix: str = "",
 ) -> Tuple[float, float]:
     """Iteratively rescale BLUE/RED until user approves.
 
@@ -115,12 +116,13 @@ def interactive_rescale_and_approve_flux(
     """
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+    scale_path = outdir / f"{objname}_join_scale{output_suffix}.txt"
 
     blue_scale = 1.0
     red_scale = 1.0
 
     if not interactive:
-        with open(outdir / f"{objname}_join_scale.txt", "w") as f:
+        with open(scale_path, "w") as f:
             f.write(f"blue_scale {blue_scale}\nred_scale {red_scale}\n")
         return blue_scale, red_scale
 
@@ -136,7 +138,7 @@ def interactive_rescale_and_approve_flux(
             print("  [Enter] Keep current scales")
             choice = input("Choice: ").strip()
             if choice.lower() == "a":
-                with open(outdir / f"{objname}_join_scale.txt", "w") as f:
+                with open(scale_path, "w") as f:
                     f.write(f"blue_scale {blue_scale}\n")
                     f.write(f"red_scale {red_scale}\n")
                 return blue_scale, red_scale
@@ -206,7 +208,7 @@ def interactive_rescale_and_approve_flux(
         def save_zoomed() -> Path:
             x0, x1 = ax.get_xlim()
             y0, y1 = ax.get_ylim()
-            fn = outdir / f"{objname}_join_scaling_zoom_x{x0:.0f}-{x1:.0f}_y{y0:.3g}-{y1:.3g}.png"
+            fn = outdir / f"{objname}_join_scaling{output_suffix}_zoom_x{x0:.0f}-{x1:.0f}_y{y0:.3g}-{y1:.3g}.png"
             fig.savefig(fn, dpi=200, bbox_inches="tight")
             return fn
 
@@ -232,7 +234,7 @@ def interactive_rescale_and_approve_flux(
         fig._kcwi_join_widgets = (blue_slider, red_slider, reset_button, approve_button)
         cid = fig.canvas.mpl_connect("key_press_event", on_key)
 
-        fig.savefig(outdir / f"{objname}_join_scaling.png", dpi=200, bbox_inches="tight")
+        fig.savefig(outdir / f"{objname}_join_scaling{output_suffix}.png", dpi=200, bbox_inches="tight")
         plt.show()
         fig.canvas.mpl_disconnect(cid)
 
@@ -242,7 +244,7 @@ def interactive_rescale_and_approve_flux(
         if decision["approved"]:
             blue_scale = float(scale_state["blue"])
             red_scale = float(scale_state["red"])
-            with open(outdir / f"{objname}_join_scale.txt", "w") as f:
+            with open(scale_path, "w") as f:
                 f.write(f"blue_scale {blue_scale}\n")
                 f.write(f"red_scale {red_scale}\n")
             return blue_scale, red_scale
@@ -261,7 +263,7 @@ def interactive_rescale_and_approve_flux(
         choice = input("Choice: ").strip()
 
         if choice.lower() == "a":
-            with open(outdir / f"{objname}_join_scale.txt", "w") as f:
+            with open(scale_path, "w") as f:
                 f.write(f"blue_scale {blue_scale}\n")
                 f.write(f"red_scale {red_scale}\n")
             return blue_scale, red_scale

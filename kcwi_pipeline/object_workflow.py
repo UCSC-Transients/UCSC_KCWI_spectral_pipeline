@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -11,12 +14,19 @@ from matplotlib.patches import Rectangle
 from matplotlib.widgets import Button, Slider
 from astropy.io import fits
 from astropy.stats import sigma_clip
+from astropy.wcs import FITSFixedWarning, WCS
 from scipy.interpolate import UnivariateSpline
 
-from .apertures import aperture_weight_mask, interactive_define_apertures, plot_apertures, review_apertures
+from .apertures import (
+    WhiteLightRangeController,
+    aperture_weight_mask,
+    interactive_define_apertures,
+    plot_apertures,
+    review_apertures,
+)
 from .calibration import (
     apply_standard_telluric_correction,
-    apply_sensitivity,
+    apply_sensitivity_with_uncertainty,
     build_standard_telluric_template,
     estimate_telluric_shift,
     plot_calibration_diagnostics,
@@ -26,12 +36,30 @@ from .calibration import (
     scaled_o2_transmission,
     shifted_transmission,
 )
-from .config import TargetBackgroundApertures
-from .io import get_airmass_from_header, get_lambda_axis, white_light
+from .config import ApertureShape, TargetBackgroundApertures
+from .cosmic_rays import (
+    CosmicRayRejectionConfig,
+    config_to_dict,
+    plot_cr_diagnostic,
+    reject_cosmic_rays,
+    resolve_cr_workers,
+    write_cr_cleaned_fits,
+    write_cr_mask_fits,
+)
+from .io import get_airmass_from_header, get_lambda_axis
 from .join import concat_join, interactive_rescale_and_approve_flux, plot_join_diagnostic
 from .project import find_project_root
+from .spectral_cr import (
+    ResolvingPowerEstimate,
+    SpectralCRConfig,
+    SpectralCRDetection,
+    detect_cr_like_narrow_features,
+    interpolate_rejected_candidate,
+    resolving_power_from_header,
+)
 from .standard_flux import STANDARD_NAMES, list_standard_stars, reference_flux
 from .utils import prompt, safe_filename
+from .uncertainty import linear_resample_with_uncertainty
 
 
 DEFAULT_SIDE_RANGES = {
@@ -59,6 +87,10 @@ BACKGROUND_CLIP_SIGMA = 2.5
 BACKGROUND_CLIP_MAXITERS = 5
 COADD_CLIP_SIGMA = 2.0
 COADD_CLIP_MAXITERS = 5
+EXPOSURE_TIME_KEYS = ("XPOSURE", "ELAPTIME", "EXPTIME", "TELAPSE", "TTIME")
+ICUBED_SPECTRUM_UNITS = "electron/s"
+ICUBES_SPECTRUM_UNITS = "native_icubes_flux"
+CALIBRATION_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -69,6 +101,80 @@ class ExposureSpectrum:
     spectrum_path: str
     aperture_path: str
     airmass: Optional[float]
+    exposure_time_seconds: Optional[float]
+    exposure_time_keyword: Optional[str]
+    spectrum_units: str
+    cr_status: str
+    cr_cleaned_path: Optional[str]
+    cr_mask_path: Optional[str]
+    cr_nvoxels: Optional[int]
+    cr_fraction: Optional[float]
+    cr_diagnostics: Dict[str, int]
+    cr_runtime_seconds: Optional[float]
+
+
+@dataclass(frozen=True)
+class _ApertureTemplate:
+    apertures: TargetBackgroundApertures
+    header: fits.Header
+    side: str
+    exposure_path: Path
+
+
+@dataclass(frozen=True)
+class _SideExtractionResult:
+    coadd_path: Path
+    aperture_template: _ApertureTemplate
+
+
+def _exposure_time_from_header(
+    header: fits.Header,
+    *,
+    label: str = "KCWI exposure",
+) -> Tuple[float, str]:
+    """Return a positive exposure time and the FITS keyword that supplied it."""
+    invalid = []
+    for key in EXPOSURE_TIME_KEYS:
+        if key not in header:
+            continue
+        try:
+            value = float(header[key])
+        except (TypeError, ValueError):
+            invalid.append(f"{key}={header[key]!r}")
+            continue
+        if np.isfinite(value) and value > 0:
+            return value, key
+        invalid.append(f"{key}={header[key]!r}")
+
+    detail = f" Invalid values: {', '.join(invalid)}." if invalid else ""
+    keys = ", ".join(EXPOSURE_TIME_KEYS)
+    raise ValueError(
+        f"{label} is an *_icubed.fits product but has no finite, positive "
+        f"exposure time in {keys}.{detail}"
+    )
+
+
+def _normalize_extracted_spectrum_for_product(
+    product_type: str,
+    header: fits.Header,
+    values: np.ndarray,
+    sigma: Optional[np.ndarray],
+    *,
+    label: str = "KCWI exposure",
+) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[float], Optional[str], str]:
+    """Convert icubed electrons to rates; leave DRP-calibrated icubes unchanged."""
+    values_out = np.asarray(values, dtype=float)
+    sigma_out = None if sigma is None else np.asarray(sigma, dtype=float)
+    if product_type == "icubes":
+        return values_out, sigma_out, None, None, ICUBES_SPECTRUM_UNITS
+    if product_type != "icubed":
+        raise ValueError(f"Unknown KCWI cube product type: {product_type}")
+
+    exposure_time, keyword = _exposure_time_from_header(header, label=label)
+    values_out = values_out / exposure_time
+    if sigma_out is not None:
+        sigma_out = sigma_out / exposure_time
+    return values_out, sigma_out, exposure_time, keyword, ICUBED_SPECTRUM_UNITS
 
 
 def _side_limits(side: str) -> Tuple[float, float]:
@@ -88,8 +194,27 @@ def _trim_side_arrays(side: str, lam: np.ndarray, *arrays: Optional[np.ndarray])
 
 def _load_cube_product(path: Path) -> Tuple[np.ndarray, fits.Header, Optional[np.ndarray], Optional[np.ndarray]]:
     with fits.open(path, memmap=False) as hdul:
-        science = np.array(hdul[0].data, dtype=np.float32)
-        header = hdul[0].header.copy()
+        science_hdu = next(
+            (hdu for hdu in hdul if getattr(hdu, "data", None) is not None and getattr(hdu.data, "ndim", 0) == 3),
+            None,
+        )
+        if science_hdu is None:
+            raise ValueError(f"No 3D science cube found in {path}")
+        science = np.array(science_hdu.data, dtype=np.float32)
+        header = science_hdu.header.copy()
+        if science_hdu is not hdul[0]:
+            for key in (
+                "OBJECT", "TARGNAME", "CAMERA", "AIRMASS", "IMTYPE",
+                "DATE-OBS", "DATE-BEG", "DATE-END", "EXPTIME", "ELAPTIME",
+                "XPOSURE", "TELAPSE", "TTIME",
+            ):
+                if key in hdul[0].header and key not in header:
+                    header[key] = hdul[0].header[key]
+            for key, value in hdul[0].header.items():
+                if key not in header and (
+                    key.startswith(("WCSAXES", "CTYPE", "CRVAL", "CRPIX", "CDELT", "CD", "PC"))
+                ):
+                    header[key] = value
         uncert = None
         flags = None
         for hdu in hdul[1:]:
@@ -113,6 +238,219 @@ def _aperture_from_json(path: Path) -> TargetBackgroundApertures:
         return TargetBackgroundApertures.from_dict(json.load(f))
 
 
+def _normalize_aperture_angle(theta: float) -> float:
+    return float((theta + 0.5 * np.pi) % np.pi - 0.5 * np.pi)
+
+
+def _celestial_wcs(header: fits.Header, label: str) -> WCS:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FITSFixedWarning)
+            full_wcs = WCS(header)
+    except Exception as exc:
+        raise ValueError(f"{label} WCS could not be parsed: {exc}") from exc
+    if not full_wcs.has_celestial:
+        raise ValueError(f"{label} cube has no celestial WCS")
+    celestial = full_wcs.celestial
+    if celestial.pixel_n_dim != 2 or celestial.world_n_dim != 2:
+        raise ValueError(f"{label} celestial WCS is not two-dimensional")
+    return celestial
+
+
+def _local_pixel_transform(
+    source_wcs: WCS,
+    destination_wcs: WCS,
+    x: float,
+    y: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    step = 0.5
+    source_pixels = np.array(
+        [
+            [x, y],
+            [x + step, y],
+            [x - step, y],
+            [x, y + step],
+            [x, y - step],
+        ],
+        dtype=float,
+    )
+    try:
+        world = source_wcs.all_pix2world(source_pixels, 0)
+        destination_pixels = np.asarray(
+            destination_wcs.all_world2pix(world, 0),
+            dtype=float,
+        )
+    except Exception as exc:
+        raise ValueError(f"WCS coordinate transformation failed: {exc}") from exc
+    if destination_pixels.shape != (5, 2) or not np.all(np.isfinite(destination_pixels)):
+        raise ValueError("WCS produced non-finite destination pixel coordinates")
+
+    center = destination_pixels[0]
+    jacobian = np.column_stack(
+        (
+            (destination_pixels[1] - destination_pixels[2]) / (2.0 * step),
+            (destination_pixels[3] - destination_pixels[4]) / (2.0 * step),
+        )
+    )
+    if not np.all(np.isfinite(jacobian)) or abs(float(np.linalg.det(jacobian))) < 1e-8:
+        raise ValueError("WCS pixel transformation is singular")
+    return center, jacobian
+
+
+def _ellipse_from_matrix(matrix: np.ndarray) -> Tuple[float, float, float]:
+    axes, lengths, _ = np.linalg.svd(matrix)
+    if not np.all(np.isfinite(lengths)) or float(lengths[-1]) <= 0:
+        raise ValueError("WCS produced invalid aperture dimensions")
+    theta = _normalize_aperture_angle(float(np.arctan2(axes[1, 0], axes[0, 0])))
+    return float(lengths[0]), float(lengths[1]), theta
+
+
+def _shape_center_and_jacobian(
+    shape: ApertureShape,
+    source_wcs: WCS,
+    destination_wcs: WCS,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if len(shape.params) < 2:
+        raise ValueError(f"Aperture shape {shape.shape!r} has no center")
+    x, y = float(shape.params[0]), float(shape.params[1])
+    if not np.isfinite(x) or not np.isfinite(y):
+        raise ValueError("Aperture center is not finite")
+    return _local_pixel_transform(source_wcs, destination_wcs, x, y)
+
+
+def _transform_aperture_shape(
+    shape: ApertureShape,
+    source_wcs: WCS,
+    destination_wcs: WCS,
+) -> ApertureShape:
+    center, jacobian = _shape_center_and_jacobian(shape, source_wcs, destination_wcs)
+    x, y = (float(center[0]), float(center[1]))
+    kind = shape.shape
+    params = tuple(float(value) for value in shape.params)
+
+    if kind == "circle":
+        _, _, radius = params
+        a, b, theta = _ellipse_from_matrix(jacobian * radius)
+        if a / b <= 1.01:
+            return ApertureShape("circle", (x, y, 0.5 * (a + b)))
+        return ApertureShape("ellipse", (x, y, a, b, theta))
+
+    if kind == "ellipse":
+        _, _, a, b, theta = params
+        rotation = np.array(
+            [[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]],
+            dtype=float,
+        )
+        out_a, out_b, out_theta = _ellipse_from_matrix(
+            jacobian @ rotation @ np.diag([a, b])
+        )
+        return ApertureShape("ellipse", (x, y, out_a, out_b, out_theta))
+
+    if kind == "rect":
+        _, _, width, height, theta = params
+        rotation = np.array(
+            [[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]],
+            dtype=float,
+        )
+        width_vector = jacobian @ (rotation[:, 0] * width)
+        height_vector = jacobian @ (rotation[:, 1] * height)
+        out_width = float(np.linalg.norm(width_vector))
+        out_height = float(np.linalg.norm(height_vector))
+        if not np.isfinite(out_width + out_height) or min(out_width, out_height) <= 0:
+            raise ValueError("WCS produced invalid rectangular-aperture dimensions")
+        out_theta = _normalize_aperture_angle(
+            float(np.arctan2(width_vector[1], width_vector[0]))
+        )
+        return ApertureShape("rect", (x, y, out_width, out_height, out_theta))
+
+    if kind == "circle_annulus":
+        _, _, radius_in, radius_out = params
+        axes, scales, _ = np.linalg.svd(jacobian)
+        if not np.all(np.isfinite(scales)) or float(scales[-1]) <= 0:
+            raise ValueError("WCS produced invalid annulus dimensions")
+        if float(scales[0] / scales[1]) <= 1.01:
+            scale = 0.5 * float(scales[0] + scales[1])
+            return ApertureShape(
+                "circle_annulus",
+                (x, y, radius_in * scale, radius_out * scale),
+            )
+        theta = _normalize_aperture_angle(float(np.arctan2(axes[1, 0], axes[0, 0])))
+        return ApertureShape(
+            "ellipse_annulus",
+            (
+                x,
+                y,
+                radius_in * float(scales[0]),
+                radius_in * float(scales[1]),
+                radius_out * float(scales[0]),
+                radius_out * float(scales[1]),
+                theta,
+            ),
+        )
+
+    if kind == "ellipse_annulus":
+        _, _, a_in, b_in, a_out, b_out, theta = params
+        rotation = np.array(
+            [[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]],
+            dtype=float,
+        )
+        outer_matrix = jacobian @ rotation @ np.diag([a_out, b_out])
+        out_a, out_b, out_theta = _ellipse_from_matrix(outer_matrix)
+        inner_matrix = jacobian @ rotation @ np.diag([a_in, b_in])
+        inner_covariance = inner_matrix @ inner_matrix.T
+        major_direction = np.array([np.cos(out_theta), np.sin(out_theta)])
+        minor_direction = np.array([-np.sin(out_theta), np.cos(out_theta)])
+        out_a_in = float(np.sqrt(major_direction @ inner_covariance @ major_direction))
+        out_b_in = float(np.sqrt(minor_direction @ inner_covariance @ minor_direction))
+        out_a_in = min(out_a_in, out_a * (1.0 - 1e-6))
+        out_b_in = min(out_b_in, out_b * (1.0 - 1e-6))
+        if not np.isfinite(out_a_in + out_b_in) or min(out_a_in, out_b_in) <= 0:
+            raise ValueError("WCS produced invalid annulus dimensions")
+        return ApertureShape(
+            "ellipse_annulus",
+            (x, y, out_a_in, out_b_in, out_a, out_b, out_theta),
+        )
+
+    raise ValueError(f"Unsupported aperture shape for WCS transfer: {kind!r}")
+
+
+def _transform_apertures_between_headers(
+    apertures: TargetBackgroundApertures,
+    source_header: fits.Header,
+    destination_header: fits.Header,
+    destination_shape: Tuple[int, int],
+) -> TargetBackgroundApertures:
+    source_wcs = _celestial_wcs(source_header, "source")
+    destination_wcs = _celestial_wcs(destination_header, "destination")
+    transformed = TargetBackgroundApertures(
+        target=_transform_aperture_shape(apertures.target, source_wcs, destination_wcs),
+        background=_transform_aperture_shape(
+            apertures.background,
+            source_wcs,
+            destination_wcs,
+        ),
+    )
+
+    ny, nx = (int(destination_shape[0]), int(destination_shape[1]))
+    for label, shape in (
+        ("target", transformed.target),
+        ("background", transformed.background),
+    ):
+        x, y = float(shape.params[0]), float(shape.params[1])
+        if not (0.0 <= x < nx and 0.0 <= y < ny):
+            raise ValueError(
+                f"transformed {label} center ({x:.2f}, {y:.2f}) is outside "
+                f"the destination image ({nx} x {ny})"
+            )
+        try:
+            area = float(np.sum(aperture_weight_mask(ny, nx, shape)))
+        except Exception as exc:
+            raise ValueError(f"transformed {label} aperture is invalid: {exc}") from exc
+        if not np.isfinite(area) or area <= 0:
+            raise ValueError(f"transformed {label} aperture does not overlap the destination image")
+    return transformed
+
+
 def _extract_counts_with_uncert(
     cube: np.ndarray,
     uncert: Optional[np.ndarray],
@@ -122,6 +460,14 @@ def _extract_counts_with_uncert(
     label: str = "",
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     nz, ny, nx = cube.shape
+    if uncert is not None and uncert.shape != cube.shape:
+        raise ValueError(
+            f"Uncertainty cube shape {uncert.shape} does not match science cube shape {cube.shape}"
+        )
+    if flags is not None and flags.shape != cube.shape:
+        raise ValueError(
+            f"Flag cube shape {flags.shape} does not match science cube shape {cube.shape}"
+        )
     w_tgt_base = aperture_weight_mask(ny, nx, aps.target)
     w_bkg_base = aperture_weight_mask(ny, nx, aps.background)
     tgt_area = float(np.sum(w_tgt_base))
@@ -152,6 +498,8 @@ def _extract_counts_with_uncert(
 
     counts = np.zeros(nz, dtype=float)
     sigma = np.full(nz, np.nan, dtype=float) if uncert is not None else None
+    background_inflated = 0
+    background_inflation_factors: List[float] = []
 
     for k in range(nz):
         img = cube[k, :, :]
@@ -165,6 +513,7 @@ def _extract_counts_with_uncert(
         finite_bkg = np.isfinite(img) & (w_bkg > 0)
 
         tgt_sum = np.nansum(w_tgt[finite_tgt] * img[finite_tgt])
+        effective_tgt_area = float(np.sum(w_tgt[finite_tgt]))
         bkg = 0.0
         bkg_var_mean = 0.0
         if np.any(finite_bkg):
@@ -178,18 +527,64 @@ def _extract_counts_with_uncert(
             )
             keep = ~np.ma.getmaskarray(clipped)
             if np.any(keep):
-                bkg = float(np.average(bkg_vals[keep], weights=bkg_weights[keep]))
+                kept_values = bkg_vals[keep]
+                kept_weights = bkg_weights[keep]
+                sum_weights = float(np.sum(kept_weights))
+                sum_weights_squared = float(np.sum(kept_weights ** 2))
+                bkg = float(np.average(kept_values, weights=kept_weights))
+
+                empirical_var_mean = 0.0
+                if sum_weights > 0 and sum_weights_squared > 0:
+                    effective_n = sum_weights ** 2 / sum_weights_squared
+                    sample_denom = sum_weights - sum_weights_squared / sum_weights
+                    if effective_n > 1 and sample_denom > 0:
+                        sample_variance = float(
+                            np.sum(kept_weights * (kept_values - bkg) ** 2)
+                            / sample_denom
+                        )
+                        if np.isfinite(sample_variance) and sample_variance >= 0:
+                            empirical_var_mean = sample_variance / effective_n
+
                 if uncert is not None:
-                    bkg_var_vals = uncert[k, :, :].astype(float)[finite_bkg][keep] ** 2
-                    denom = np.sum(bkg_weights[keep]) ** 2
-                    if denom > 0:
-                        bkg_var_mean = float(np.sum((bkg_weights[keep] ** 2) * bkg_var_vals) / denom)
-        counts[k] = tgt_sum - bkg * tgt_area
+                    kept_sigma = np.abs(
+                        uncert[k, :, :].astype(float)[finite_bkg][keep]
+                    )
+                    valid_sigma = np.isfinite(kept_sigma)
+                    formal_var_mean = np.nan
+                    if sum_weights > 0 and np.all(valid_sigma):
+                        formal_var_mean = float(
+                            np.sum((kept_weights ** 2) * kept_sigma ** 2)
+                            / sum_weights ** 2
+                        )
+                    if np.isfinite(formal_var_mean):
+                        bkg_var_mean = max(formal_var_mean, empirical_var_mean)
+                        if empirical_var_mean > formal_var_mean and formal_var_mean > 0:
+                            background_inflated += 1
+                            background_inflation_factors.append(
+                                float(np.sqrt(empirical_var_mean / formal_var_mean))
+                            )
+                    else:
+                        bkg_var_mean = empirical_var_mean
+        counts[k] = tgt_sum - bkg * effective_tgt_area
 
         if uncert is not None:
-            var = uncert[k, :, :].astype(float) ** 2
-            var_tgt = np.nansum((w_tgt[finite_tgt] ** 2) * var[finite_tgt])
-            sigma[k] = np.sqrt(var_tgt + (tgt_area ** 2) * bkg_var_mean)
+            sigma_image = np.abs(uncert[k, :, :].astype(float))
+            target_sigma = sigma_image[finite_tgt]
+            if np.all(np.isfinite(target_sigma)):
+                var_tgt = float(
+                    np.sum((w_tgt[finite_tgt] ** 2) * target_sigma ** 2)
+                )
+                sigma[k] = np.sqrt(
+                    var_tgt + (effective_tgt_area ** 2) * bkg_var_mean
+                )
+
+    if background_inflated:
+        median_factor = float(np.median(background_inflation_factors))
+        print(
+            f"{prefix}Empirical background scatter exceeded the formal background "
+            f"uncertainty in {background_inflated}/{nz} wavelength slices "
+            f"(median sigma inflation {median_factor:.2f}x in those slices)."
+        )
 
     return counts, sigma
 
@@ -221,7 +616,15 @@ def _plot_spectrum_png(
     if sigma is not None:
         lo = flux - sigma
         hi = flux + sigma
-        ax.fill_between(lam, lo, hi, color="0.5", alpha=0.18, linewidth=0, label="1 sigma")
+        ax.fill_between(
+            lam,
+            lo,
+            hi,
+            color="0.65",
+            alpha=0.32,
+            linewidth=0,
+            label="1 sigma uncertainty",
+        )
     finite = np.isfinite(lam) & np.isfinite(flux)
     if np.any(finite):
         y0, y1 = np.nanpercentile(flux[finite], [1, 99])
@@ -260,20 +663,20 @@ def _plot_joined_spectrum_png(
             lam_blue,
             flux_blue - sigma_blue,
             flux_blue + sigma_blue,
-            color="tab:blue",
-            alpha=0.14,
+            color="0.65",
+            alpha=0.30,
             linewidth=0,
-            label="BLUE 1 sigma",
+            label="1 sigma uncertainty",
         )
     if sigma_red is not None:
         ax.fill_between(
             lam_red,
             flux_red - sigma_red,
             flux_red + sigma_red,
-            color="tab:red",
-            alpha=0.14,
+            color="0.65",
+            alpha=0.30,
             linewidth=0,
-            label="RED 1 sigma",
+            label="_nolegend_",
         )
     both_flux = np.concatenate([np.asarray(flux_blue, dtype=float), np.asarray(flux_red, dtype=float)])
     finite = np.isfinite(both_flux)
@@ -312,8 +715,12 @@ def _coadd_1d_spectra(
             y_i = y
             sig_i = sig
         else:
-            y_i = np.interp(lam_ref, lam, y, left=np.nan, right=np.nan)
-            sig_i = np.interp(lam_ref, lam, sig, left=np.nan, right=np.nan) if sig is not None else None
+            y_i, sig_i = linear_resample_with_uncertainty(
+                lam_ref,
+                lam,
+                y,
+                sig,
+            )
         values.append(y_i)
         if have_sigma:
             sigmas.append(sig_i)
@@ -340,7 +747,20 @@ def _coadd_1d_spectra(
         sumw = np.sum(weights, axis=0)
         valid = sumw > 0
         out[valid] = np.sum(np.where(good, stack, 0.0) * weights, axis=0)[valid] / sumw[valid]
-        out_sigma[valid] = np.sqrt(1.0 / sumw[valid])
+        formal_sigma = np.sqrt(1.0 / sumw[valid])
+        residual = stack[:, valid] - out[valid][None, :]
+        chi_square = np.sum(
+            np.where(good[:, valid], residual ** 2 * weights[:, valid], 0.0),
+            axis=0,
+        )
+        degrees_of_freedom = n_good[valid].astype(float) - 1.0
+        reduced_chi_square = np.ones(formal_sigma.shape, dtype=float)
+        can_inflate = degrees_of_freedom > 0
+        reduced_chi_square[can_inflate] = (
+            chi_square[can_inflate] / degrees_of_freedom[can_inflate]
+        )
+        inflation = np.sqrt(np.maximum(1.0, reduced_chi_square))
+        out_sigma[valid] = formal_sigma * inflation
     else:
         valid = n_good > 0
         out[valid] = np.sum(np.where(good, stack, 0.0), axis=0)[valid] / n_good[valid]
@@ -529,8 +949,587 @@ def _review_1d_coadd_sigma_clip(
     )
 
 
-def _side_files(object_dir: Path, side: str) -> List[Path]:
-    return sorted((object_dir / side).glob("*_icubes.fits"))
+def _candidate_plot_edges(
+    wavelength: np.ndarray,
+    start: int,
+    stop: int,
+) -> Tuple[float, float]:
+    left = 0.5 * (wavelength[start - 1] + wavelength[start])
+    right = 0.5 * (wavelength[stop - 1] + wavelength[stop])
+    return float(min(left, right)), float(max(left, right))
+
+
+def _review_spectral_cr_candidates(
+    title: str,
+    wavelength: np.ndarray,
+    flux: np.ndarray,
+    sigma: Optional[np.ndarray],
+    detection: SpectralCRDetection,
+) -> Tuple[np.ndarray, Optional[np.ndarray], List[Dict[str, object]]]:
+    candidates = detection.candidates
+    if not candidates:
+        return flux.copy(), None if sigma is None else sigma.copy(), []
+
+    state: Dict[str, object] = {
+        "index": 0,
+        "phase": "candidates",
+        "completed": False,
+        "flux": flux.copy(),
+        "sigma": None if sigma is None else sigma.copy(),
+        "decisions": [],
+    }
+    fig, (ax_flux, ax_overview) = plt.subplots(
+        2,
+        1,
+        figsize=(11.5, 7.0),
+        sharex=False,
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
+    fig.subplots_adjust(left=0.09, right=0.97, bottom=0.18, top=0.84, hspace=0.08)
+    accept_ax = fig.add_axes([0.63, 0.055, 0.14, 0.065])
+    remove_ax = fig.add_axes([0.79, 0.055, 0.17, 0.065])
+    accept_button = Button(accept_ax, "Accept line")
+    remove_button = Button(remove_ax, "Remove as CR")
+
+    def draw_decision_spans(ax) -> None:
+        labels_used = set()
+        decisions = state["decisions"]
+        assert isinstance(decisions, list)
+        for decision in decisions:
+            start = int(decision["start_index"])
+            stop = int(decision["stop_index"])
+            left, right = _candidate_plot_edges(wavelength, start, stop)
+            removed = decision.get("decision") == "removed"
+            label = "Removed candidate" if removed else "Accepted line"
+            ax.axvspan(
+                left,
+                right,
+                color="tab:red" if removed else "tab:green",
+                alpha=0.18 if removed else 0.11,
+                label=label if label not in labels_used else None,
+            )
+            labels_used.add(label)
+
+    def draw_full_spectrum_overview(
+        current_flux: np.ndarray,
+        *,
+        zoom_limits: Optional[Tuple[float, float]],
+        candidate_wavelength: Optional[float] = None,
+    ) -> None:
+        ax_overview.clear()
+        ax_overview.plot(
+            wavelength,
+            current_flux,
+            color="black",
+            lw=0.75,
+            label="Full spectrum",
+        )
+        draw_decision_spans(ax_overview)
+        if zoom_limits is not None:
+            left, right = zoom_limits
+            ax_overview.axvspan(
+                left,
+                right,
+                color="tab:blue",
+                alpha=0.18,
+                label="Upper-panel wavelength range",
+            )
+        if candidate_wavelength is not None:
+            ax_overview.axvline(
+                candidate_wavelength,
+                color="tab:red",
+                lw=0.9,
+                alpha=0.85,
+                label="Current candidate",
+            )
+        finite_wavelength = wavelength[np.isfinite(wavelength)]
+        if finite_wavelength.size:
+            ax_overview.set_xlim(
+                float(np.min(finite_wavelength)),
+                float(np.max(finite_wavelength)),
+            )
+        ax_overview.set_ylabel("Counts")
+        ax_overview.set_xlabel("Wavelength (A)")
+        ax_overview.grid(alpha=0.2)
+        ax_overview.legend(fontsize=7, ncol=3, loc="best")
+
+    def redraw_candidate() -> None:
+        index = int(state["index"])
+        candidate = candidates[index]
+        current_flux = np.asarray(state["flux"], dtype=float)
+        current_sigma = state["sigma"]
+        radius = max(int(np.ceil(4.0 * candidate.expected_fwhm_pixels)), 10)
+        lo = max(candidate.peak_index - radius, 0)
+        hi = min(candidate.peak_index + radius + 1, wavelength.size)
+        region = slice(lo, hi)
+        mask_lo, mask_hi = _candidate_plot_edges(
+            wavelength,
+            candidate.start_index,
+            candidate.stop_index,
+        )
+        lsf_half_width = 0.5 * candidate.expected_fwhm_angstrom
+
+        ax_flux.clear()
+        ax_flux.plot(
+            wavelength[region],
+            current_flux[region],
+            color="black",
+            lw=1.0,
+            marker=".",
+            ms=4,
+            label="Coadded spectrum",
+        )
+        ax_flux.plot(
+            wavelength[region],
+            detection.continuum[region],
+            color="0.45",
+            lw=1.0,
+            linestyle="--",
+            label="Local continuum",
+        )
+        uncertainty = detection.noise if current_sigma is None else np.asarray(current_sigma)
+        ax_flux.fill_between(
+            wavelength[region],
+            current_flux[region] - uncertainty[region],
+            current_flux[region] + uncertainty[region],
+            color="0.5",
+            alpha=0.16,
+            linewidth=0,
+            label="1 sigma",
+        )
+        ax_flux.axvspan(
+            candidate.wavelength - lsf_half_width,
+            candidate.wavelength + lsf_half_width,
+            color="tab:blue",
+            alpha=0.10,
+            label="Expected LSF FWHM",
+        )
+        ax_flux.axvspan(
+            mask_lo,
+            mask_hi,
+            color="tab:red",
+            alpha=0.18,
+            label="Proposed removal",
+        )
+        ax_flux.axvline(candidate.wavelength, color="tab:red", lw=0.9, alpha=0.8)
+        ax_flux.set_ylabel("Counts")
+        ax_flux.grid(alpha=0.2)
+        ax_flux.legend(fontsize=8, ncol=2, loc="best")
+        zoom_limits = (
+            float(min(wavelength[lo], wavelength[hi - 1])),
+            float(max(wavelength[lo], wavelength[hi - 1])),
+        )
+        ax_flux.set_xlim(*zoom_limits)
+        draw_full_spectrum_overview(
+            current_flux,
+            zoom_limits=zoom_limits,
+            candidate_wavelength=candidate.wavelength,
+        )
+        fig.suptitle(
+            f"{title}: {candidate.polarity} candidate {index + 1}/{len(candidates)} "
+            f"at {candidate.wavelength:.2f} A\n"
+            f"S/N={candidate.snr:.1f}; measured FWHM={candidate.measured_fwhm_pixels:.2f} px; "
+            f"expected={candidate.expected_fwhm_pixels:.2f} px; ratio={candidate.width_ratio:.2f}"
+        )
+        accept_button.label.set_text("Accept line")
+        remove_button.label.set_text("Remove as CR")
+        fig.canvas.draw_idle()
+
+    def redraw_result() -> None:
+        current_flux = np.asarray(state["flux"], dtype=float)
+        current_sigma = state["sigma"]
+        ax_flux.clear()
+        ax_flux.plot(
+            wavelength,
+            current_flux,
+            color="black",
+            lw=0.9,
+            label="Resultant spectrum",
+        )
+        if current_sigma is not None:
+            uncertainty = np.asarray(current_sigma, dtype=float)
+            ax_flux.fill_between(
+                wavelength,
+                current_flux - uncertainty,
+                current_flux + uncertainty,
+                color="0.5",
+                alpha=0.15,
+                linewidth=0,
+                label="Resultant 1 sigma",
+            )
+        draw_decision_spans(ax_flux)
+        ax_flux.set_ylabel("Counts")
+        ax_flux.grid(alpha=0.2)
+        ax_flux.legend(fontsize=8, ncol=3, loc="best")
+        draw_full_spectrum_overview(current_flux, zoom_limits=None)
+        decisions = state["decisions"]
+        assert isinstance(decisions, list)
+        removed_count = sum(item.get("decision") == "removed" for item in decisions)
+        fig.suptitle(
+            f"{title}: full resultant spectrum\n"
+            f"Removed {removed_count}/{len(candidates)} candidates"
+        )
+        accept_button.label.set_text("Redo review")
+        remove_button.label.set_text("Accept result")
+        fig.canvas.draw_idle()
+
+    def finish_or_advance() -> None:
+        state["index"] = int(state["index"]) + 1
+        if int(state["index"]) >= len(candidates):
+            state["phase"] = "result"
+            redraw_result()
+        else:
+            redraw_candidate()
+
+    def accept(_event=None) -> None:
+        candidate = candidates[int(state["index"])]
+        decisions = state["decisions"]
+        assert isinstance(decisions, list)
+        decisions.append({**candidate.to_dict(), "decision": "accepted"})
+        finish_or_advance()
+
+    def remove(_event=None) -> None:
+        candidate = candidates[int(state["index"])]
+        cleaned_flux, cleaned_sigma, interpolation = interpolate_rejected_candidate(
+            wavelength,
+            np.asarray(state["flux"], dtype=float),
+            state["sigma"],
+            candidate,
+            continuum=detection.continuum,
+            noise=detection.noise,
+        )
+        state["flux"] = cleaned_flux
+        state["sigma"] = cleaned_sigma
+        decisions = state["decisions"]
+        assert isinstance(decisions, list)
+        decisions.append(
+            {
+                **candidate.to_dict(),
+                "decision": "removed",
+                "interpolation": interpolation,
+            }
+        )
+        finish_or_advance()
+
+    def redo_review() -> None:
+        state["index"] = 0
+        state["phase"] = "candidates"
+        state["flux"] = flux.copy()
+        state["sigma"] = None if sigma is None else sigma.copy()
+        state["decisions"] = []
+        redraw_candidate()
+
+    def accept_result() -> None:
+        state["completed"] = True
+        plt.close(fig)
+
+    def left_button_action(_event=None) -> None:
+        if state["phase"] == "result":
+            redo_review()
+        else:
+            accept()
+
+    def right_button_action(_event=None) -> None:
+        if state["phase"] == "result":
+            accept_result()
+        else:
+            remove()
+
+    def on_key(event) -> None:
+        if state["phase"] == "result":
+            if event.key in ("a", "enter", "return"):
+                accept_result()
+            elif event.key == "r":
+                redo_review()
+        elif event.key in ("a", "enter", "return"):
+            accept()
+        elif event.key in ("r", "backspace", "delete"):
+            remove()
+
+    accept_button.on_clicked(left_button_action)
+    remove_button.on_clicked(right_button_action)
+    cid = fig.canvas.mpl_connect("key_press_event", on_key)
+    fig._kcwi_spectral_cr_widgets = (accept_button, remove_button)
+    fig._kcwi_spectral_cr_axes = (ax_flux, ax_overview)
+    redraw_candidate()
+    plt.show()
+    fig.canvas.mpl_disconnect(cid)
+
+    if not state["completed"]:
+        raise RuntimeError("Spectral CR candidate review was not completed")
+    return state["flux"], state["sigma"], state["decisions"]
+
+
+def _plot_spectral_cr_review_summary(
+    path: Path,
+    title: str,
+    wavelength: np.ndarray,
+    original_flux: np.ndarray,
+    cleaned_flux: np.ndarray,
+    cleaned_sigma: Optional[np.ndarray],
+    decisions: List[Dict[str, object]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(11, 4.8))
+    ax.plot(wavelength, original_flux, color="0.65", lw=0.7, label="Before review")
+    ax.plot(wavelength, cleaned_flux, color="black", lw=1.0, label="After review")
+    if cleaned_sigma is not None:
+        ax.fill_between(
+            wavelength,
+            cleaned_flux - cleaned_sigma,
+            cleaned_flux + cleaned_sigma,
+            color="0.5",
+            alpha=0.15,
+            linewidth=0,
+            label="After-review 1 sigma",
+        )
+    labels_used = set()
+    for decision in decisions:
+        start = int(decision["start_index"])
+        stop = int(decision["stop_index"])
+        left, right = _candidate_plot_edges(wavelength, start, stop)
+        removed = decision.get("decision") == "removed"
+        label = "Removed candidate" if removed else "Accepted line"
+        ax.axvspan(
+            left,
+            right,
+            color="tab:red" if removed else "tab:green",
+            alpha=0.18 if removed else 0.11,
+            label=label if label not in labels_used else None,
+        )
+        labels_used.add(label)
+    finite = np.isfinite(cleaned_flux)
+    if np.any(finite):
+        y0, y1 = np.nanpercentile(cleaned_flux[finite], [1, 99])
+        if np.isfinite(y0) and np.isfinite(y1) and y1 > y0:
+            pad = 0.1 * (y1 - y0)
+            ax.set_ylim(y0 - pad, y1 + pad)
+    ax.set_xlabel("Wavelength (A)")
+    ax.set_ylabel("Counts")
+    ax.set_title(title)
+    ax.grid(alpha=0.2)
+    ax.legend(fontsize=8, ncol=2)
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _side_product_files(object_dir: Path, side: str) -> Tuple[str, List[Path]]:
+    icubed = sorted((object_dir / side).glob("*_icubed.fits"))
+    icubes = sorted((object_dir / side).glob("*_icubes.fits"))
+    if icubed and icubes:
+        raise ValueError(
+            f"{object_dir / side} contains both *_icubed.fits and *_icubes.fits. "
+            "All standards and science targets must use one consistent cube type."
+        )
+    if icubed:
+        return "icubed", icubed
+    if icubes:
+        return "icubes", icubes
+    return "", []
+
+
+def _side_files(object_dir: Path, side: str, product_type: Optional[str] = None) -> List[Path]:
+    detected_type, files = _side_product_files(object_dir, side)
+    if product_type is not None and product_type != detected_type:
+        return []
+    return files
+
+
+def _saved_aperture_template(
+    object_dir: Path,
+    side: str,
+) -> Optional[_ApertureTemplate]:
+    for exposure_path in _side_files(object_dir, side):
+        aperture_path = object_dir / "apertures" / side / f"{exposure_path.stem}_aperture.json"
+        if not aperture_path.exists():
+            continue
+        try:
+            apertures = _aperture_from_json(aperture_path)
+            header = fits.getheader(exposure_path, 0)
+        except Exception as exc:
+            print(
+                f"[{object_dir.name} {side}] WARNING: Could not load saved aperture "
+                f"template from {aperture_path}: {exc}"
+            )
+            continue
+        return _ApertureTemplate(
+            apertures=apertures,
+            header=header,
+            side=side,
+            exposure_path=exposure_path,
+        )
+    return None
+
+
+def _cr_cleaned_path(object_dir: Path, side: str, source_path: Path) -> Path:
+    return object_dir / side / f"{source_path.stem}_crclean.fits"
+
+
+def _cr_mask_path(object_dir: Path, side: str, source_path: Path) -> Path:
+    return object_dir / side / f"{source_path.stem}_crmask.fits"
+
+
+def _format_cr_mask_summary(nvoxels: Optional[int], fraction: Optional[float]) -> str:
+    if nvoxels is None and fraction is None:
+        return "masking summary unavailable"
+    if nvoxels is None:
+        return f"masked {100.0 * float(fraction):.4f}% of finite cube"
+    if fraction is None:
+        return f"masked {int(nvoxels)} voxels"
+    return f"masked {int(nvoxels)} voxels ({100.0 * float(fraction):.4f}% of finite cube)"
+
+
+def _write_reused_cr_mask_if_needed(clean_path: Path, mask_path: Path) -> bool:
+    if mask_path.exists():
+        return True
+    try:
+        with fits.open(clean_path, memmap=False) as hdul:
+            if "CR_MASK" not in hdul:
+                return False
+            mask = np.asarray(hdul["CR_MASK"].data, dtype=np.uint8)
+            n_flagged = _finite_float(hdul[0].header.get("CRNPIX"))
+            fraction_flagged = _finite_float(hdul[0].header.get("CRFRAC"))
+        write_cr_mask_fits(
+            clean_path,
+            mask_path,
+            mask,
+            n_flagged=int(n_flagged) if n_flagged is not None else None,
+            fraction_flagged=fraction_flagged,
+        )
+        return True
+    except Exception as exc:
+        print(f"WARNING: Could not write standalone CR mask from {clean_path}: {exc}")
+        return False
+
+
+def _cube_for_extraction(
+    object_dir: Path,
+    side: str,
+    source_path: Path,
+    *,
+    cr_reject: bool,
+    redo_cr_reject: bool,
+    cr_config: CosmicRayRejectionConfig,
+) -> Tuple[np.ndarray, fits.Header, Optional[np.ndarray], Optional[np.ndarray], Dict[str, object]]:
+    clean_path = _cr_cleaned_path(object_dir, side, source_path)
+    mask_path = _cr_mask_path(object_dir, side, source_path)
+    info: Dict[str, object] = {
+        "enabled": bool(cr_reject),
+        "status": "disabled",
+        "cleaned_path": None,
+        "mask_path": None,
+        "nvoxels": None,
+        "fraction": None,
+        "diagnostics": {},
+        "runtime_seconds": None,
+        "config": config_to_dict(cr_config),
+    }
+
+    if not cr_reject:
+        cube, hdr, uncert, flags = _load_cube_product(source_path)
+        print(
+            f"[CR] Stage: before white-light image, aperture review, and extraction. "
+            f"Disabled; using original cube -> {source_path}"
+        )
+        return cube, hdr, uncert, flags, info
+
+    print("[CR] Stage: before white-light image, aperture review, and extraction.")
+    print(f"[CR] Config: {config_to_dict(cr_config)}")
+    if clean_path.exists() and not redo_cr_reject:
+        cube, hdr, uncert, flags = _load_cube_product(clean_path)
+        method = str(hdr.get("CRMETH", "")).strip().upper()
+        uncertainty_is_current = uncert is None or bool(hdr.get("CRUUPD", False))
+        if method == "KCWI_DUAL" and uncertainty_is_current:
+            cr_nvoxels = _finite_float(hdr.get("CRNPIX"))
+            cr_fraction = _finite_float(hdr.get("CRFRAC"))
+            cr_runtime = _finite_float(hdr.get("CRTIME"))
+            cr_nvoxels_int = int(cr_nvoxels) if cr_nvoxels is not None else None
+            mask_available = _write_reused_cr_mask_if_needed(clean_path, mask_path)
+            info.update({
+                "status": "reused_existing",
+                "cleaned_path": str(clean_path),
+                "mask_path": str(mask_path) if mask_available else None,
+                "nvoxels": cr_nvoxels_int,
+                "fraction": cr_fraction,
+                "diagnostics": {},
+                "runtime_seconds": cr_runtime,
+            })
+            print(f"[CR] Reusing existing CR-cleaned cube -> {clean_path}")
+            print(f"[CR] Result: {_format_cr_mask_summary(cr_nvoxels_int, cr_fraction)}")
+            if cr_runtime is not None:
+                print(f"[CR] Recorded rejection runtime: {cr_runtime:.2f} s")
+            if mask_available:
+                print(f"[CR] Standalone mask cube -> {mask_path}")
+            return cube, hdr, uncert, flags, info
+        if method == "KCWI_DUAL" and not uncertainty_is_current:
+            print(
+                "[CR] Existing cleaned cube predates CR uncertainty propagation; "
+                "rerunning from the original cube."
+            )
+        else:
+            print(
+                f"[CR] Existing cleaned cube uses {method or 'an unknown method'}; "
+                "rerunning with the spatial+spectral track detector."
+            )
+
+    if clean_path.exists() and redo_cr_reject:
+        print(f"[CR] --redo-cr-reject set; overwriting derived CR products from original cube.")
+
+    cube, hdr, uncert, flags = _load_cube_product(source_path)
+
+    print(f"[CR] Running rejection on original cube -> {source_path}")
+    motion_axis = str(cr_config.slice_motion_axis).lower().strip()
+    nslices = cube.shape[1] if motion_axis == "x" else cube.shape[2]
+    resolved_workers = resolve_cr_workers(cr_config.workers, nslices)
+    if resolved_workers > 1:
+        mode = "automatic" if int(cr_config.workers) == 0 else "requested"
+        print(
+            f"[CR] Parallel track detection: {resolved_workers} workers "
+            f"across {nslices} detector slices ({mode})."
+        )
+    else:
+        print(f"[CR] Track detection: serial across {nslices} detector slices.")
+    stage_started = perf_counter()
+    result = reject_cosmic_rays(cube, uncert, flags, config=cr_config)
+    print(f"[CR] Rejection runtime: {result.runtime_seconds:.2f} s")
+    write_cr_cleaned_fits(source_path, clean_path, result)
+    write_cr_mask_fits(
+        source_path,
+        mask_path,
+        result.mask,
+        n_flagged=result.n_flagged,
+        fraction_flagged=result.fraction_flagged,
+        config=result.config,
+    )
+    diag_path = object_dir / "diagnostics" / side / f"{source_path.stem}_cr_mask.png"
+    plot_cr_diagnostic(
+        result.mask,
+        diag_path,
+        title=f"{object_dir.name} {side} {source_path.stem}: CR mask",
+    )
+    info.update({
+        "status": "created",
+        "cleaned_path": str(clean_path),
+        "mask_path": str(mask_path),
+        "nvoxels": result.n_flagged,
+        "fraction": result.fraction_flagged,
+        "diagnostics": result.diagnostics,
+        "runtime_seconds": result.runtime_seconds,
+    })
+    print(f"[CR] Diagnostics: {result.diagnostics}")
+    print(
+        f"[CR] Result: {_format_cr_mask_summary(result.n_flagged, result.fraction_flagged)}"
+    )
+    print(f"[CR] Saved cleaned cube -> {clean_path}")
+    print(f"[CR] Saved standalone mask cube -> {mask_path}")
+    if result.fraction_flagged > 0.005:
+        print(
+            "[CR] WARNING: CR rejection cleaned more than 0.5% of finite cube voxels; "
+            "inspect the CR mask diagnostic before trusting this extraction."
+        )
+    print(f"[CR] Saved diagnostic -> {diag_path}")
+    print(f"[CR] Total CR stage runtime including output writes: {perf_counter() - stage_started:.2f} s")
+    return result.cleaned_cube, hdr, result.cleaned_uncert, flags, info
 
 
 def _project_calib_dir(object_dir: Path, calib_dir: Optional[Path]) -> Path:
@@ -566,12 +1565,41 @@ def _finite_float(value: object) -> Optional[float]:
     return out if np.isfinite(out) else None
 
 
-def _mean_airmass_for_side(object_dir: Path, side: str) -> Optional[float]:
-    state_path = object_dir / "extraction_state.json"
+def _load_extraction_state(state_path: Path) -> Dict[str, object]:
     if not state_path.exists():
-        return None
-    with open(state_path, "r", encoding="utf-8") as f:
-        state = json.load(f)
+        return {}
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        if not isinstance(state, dict):
+            raise ValueError("top-level JSON value is not an object")
+        return state
+    except (OSError, ValueError) as exc:
+        print(f"WARNING: Ignoring invalid extraction state {state_path}: {exc}")
+        return {}
+
+
+def _write_extraction_state(state_path: Path, state: Dict[str, object]) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = state_path.with_name(f".{state_path.name}.tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        temp_path.replace(state_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _mean_airmass_for_side(
+    object_dir: Path,
+    side: str,
+) -> Optional[float]:
+    state_path = object_dir / "extraction_state.json"
+    state = _load_extraction_state(state_path)
 
     exposures = state.get("sides", {}).get(side, {}).get("exposures", [])
     airmasses = [
@@ -594,13 +1622,58 @@ def _standard_airmass_from_calibration(cal: Dict[str, object], side: str) -> Opt
         object_dir = Path(str(counts_file)).expanduser().resolve().parent.parent
     except (OSError, RuntimeError):
         return None
-    return _mean_airmass_for_side(object_dir, side)
+    return _mean_airmass_for_side(
+        object_dir,
+        side,
+    )
 
 
-def _choose_calibration(calib_dir: Path, side: str) -> Optional[Dict[str, object]]:
+def _registry_product_type(item: Dict[str, object]) -> str:
+    """Normalize registry labels from the old quicklook implementation."""
+    value = str(item.get("product_type", "icubes"))
+    if value in {"level2", "icubes"}:
+        return "icubes"
+    if value in {"level1", "level1_quicklook", "icubed"}:
+        return "icubed"
+    return value
+
+
+def _calibration_is_compatible(item: Dict[str, object], product_type: str) -> bool:
+    """Reject pre-normalization icubed sensitivities while preserving icubes entries."""
+    if _registry_product_type(item) != product_type:
+        return False
+    if product_type != "icubed":
+        return True
+    return (
+        item.get("exposure_normalized") is True
+        and item.get("input_spectrum_units") == ICUBED_SPECTRUM_UNITS
+        and item.get("calibration_schema_version") == CALIBRATION_SCHEMA_VERSION
+    )
+
+
+def _choose_calibration(
+    calib_dir: Path,
+    side: str,
+    product_type: str = "icubes",
+) -> Optional[Dict[str, object]]:
     registry = _load_registry(calib_dir)
-    matches = [item for item in registry.get("standards", []) if item.get("side") == side]
+    product_matches = [
+        item for item in registry.get("standards", [])
+        if item.get("side") == side
+        and _registry_product_type(item) == product_type
+    ]
+    matches = [
+        item for item in product_matches
+        if _calibration_is_compatible(item, product_type)
+    ]
     if not matches:
+        if product_type == "icubed" and product_matches:
+            print(
+                f"WARNING: Ignoring {len(product_matches)} legacy {side} icubed "
+                "calibration(s) built before exposure-time normalization. "
+                "Rerun the standard-star extraction to rebuild the sensitivity."
+            )
+        print(f"No {side} calibration for cube type {product_type}.")
         return None
     print(f"\nAvailable {side} calibrations:")
     for i, item in enumerate(matches):
@@ -1077,9 +2150,18 @@ def _extract_side(
     *,
     show_plots: bool,
     redo_apertures: bool,
+    cr_reject: bool,
+    redo_cr_reject: bool,
+    cr_config: CosmicRayRejectionConfig,
+    spectral_cr_review: bool,
+    spectral_cr_resolving_power: Optional[float],
+    spectral_cr_config: SpectralCRConfig,
+    product_type: str,
+    initial_aperture_template: Optional[_ApertureTemplate] = None,
+    prefer_initial_aperture_template: bool = False,
     show_coadd_diagnostic: bool = False,
-) -> Optional[Path]:
-    files = _side_files(object_dir, side)
+) -> Optional[_SideExtractionResult]:
+    files = _side_files(object_dir, side, product_type)
     if not files:
         return None
 
@@ -1090,7 +2172,9 @@ def _extract_side(
 
     extracted: List[ExposureSpectrum] = []
     spectra_for_coadd: List[Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]] = []
+    resolving_power_estimates: List[ResolvingPowerEstimate] = []
     current_aps: Optional[TargetBackgroundApertures] = None
+    first_aperture_template: Optional[_ApertureTemplate] = None
     print(
         f"[{object_dir.name} {side}] Aperture propagation: first approved aperture is proposed "
         "for subsequent exposures; later exposure-specific saved apertures are overwritten after approval."
@@ -1098,40 +2182,156 @@ def _extract_side(
 
     for i, path in enumerate(files):
         exposure_label = f"{object_dir.name} {side} exposure {i + 1}/{len(files)}"
-        cube, hdr, uncert, flags = _load_cube_product(path)
+        cube, hdr, uncert, flags, cr_info = _cube_for_extraction(
+            object_dir,
+            side,
+            path,
+            cr_reject=cr_reject,
+            redo_cr_reject=redo_cr_reject,
+            cr_config=cr_config,
+        )
+        resolving_power_estimate = resolving_power_from_header(
+            hdr,
+            side,
+            override=spectral_cr_resolving_power,
+        )
+        if resolving_power_estimate is not None:
+            resolving_power_estimates.append(resolving_power_estimate)
         lam = get_lambda_axis(hdr, cube.shape)
         lo, hi = _side_limits(side)
-        img = white_light(cube, lam, lam_min=lo, lam_max=hi)
+        white_light_controller = WhiteLightRangeController(
+            cube,
+            lam,
+            minimum=lo,
+            maximum=hi,
+        )
+        img = white_light_controller.image()
 
         ap_path = ap_dir / f"{path.stem}_aperture.json"
-        if current_aps is None and ap_path.exists() and not redo_apertures:
+        use_initial_template = initial_aperture_template is not None and (
+            prefer_initial_aperture_template
+            or redo_apertures
+            or not ap_path.exists()
+        )
+        if current_aps is not None:
+            plot_apertures(
+                img,
+                current_aps,
+                diag_dir / f"{path.stem}_aperture_reuse_preview.png",
+                title=f"{exposure_label}: proposed current aperture",
+                show=False,
+                wavelength_controller=white_light_controller,
+            )
+            aps = review_apertures(
+                img,
+                current_aps,
+                side_label=f"{exposure_label}: proposed current aperture",
+                show=show_plots,
+                wavelength_controller=white_light_controller,
+            )
+        elif use_initial_template:
+            assert initial_aperture_template is not None
+            try:
+                proposed_aps = _transform_apertures_between_headers(
+                    initial_aperture_template.apertures,
+                    initial_aperture_template.header,
+                    hdr,
+                    (cube.shape[1], cube.shape[2]),
+                )
+            except ValueError as exc:
+                print(
+                    f"[{object_dir.name} {side}] WARNING: Could not transform approved "
+                    f"{initial_aperture_template.side} aperture into this cube: {exc}. "
+                    "Define apertures normally."
+                )
+                aps = interactive_define_apertures(
+                    img,
+                    exposure_label,
+                    show=show_plots,
+                    wavelength_controller=white_light_controller,
+                )
+            else:
+                source_name = initial_aperture_template.exposure_path.name
+                print(
+                    f"[{object_dir.name} {side}] Initial aperture proposal transformed "
+                    f"from approved {initial_aperture_template.side} aperture "
+                    f"({source_name})."
+                )
+                plot_apertures(
+                    img,
+                    proposed_aps,
+                    diag_dir / f"{path.stem}_cross_side_aperture_proposal.png",
+                    title=(
+                        f"{exposure_label}: proposal from "
+                        f"{initial_aperture_template.side} aperture"
+                    ),
+                    show=False,
+                    wavelength_controller=white_light_controller,
+                )
+                aps = review_apertures(
+                    img,
+                    proposed_aps,
+                    side_label=(
+                        f"{exposure_label}: transformed "
+                        f"{initial_aperture_template.side} aperture"
+                    ),
+                    show=show_plots,
+                    wavelength_controller=white_light_controller,
+                )
+        elif ap_path.exists() and not redo_apertures:
             aps = _aperture_from_json(ap_path)
             aps = review_apertures(
                 img,
                 aps,
                 side_label=f"{exposure_label}: saved first-exposure aperture",
                 show=show_plots,
-            )
-        elif current_aps is not None:
-            plot_apertures(img, current_aps, diag_dir / f"{path.stem}_aperture_reuse_preview.png",
-                           title=f"{exposure_label}: proposed current aperture", show=False)
-            aps = review_apertures(
-                img,
-                current_aps,
-                side_label=f"{exposure_label}: proposed current aperture",
-                show=show_plots,
+                wavelength_controller=white_light_controller,
             )
         else:
-            aps = interactive_define_apertures(img, exposure_label, show=show_plots)
+            aps = interactive_define_apertures(
+                img,
+                exposure_label,
+                show=show_plots,
+                wavelength_controller=white_light_controller,
+            )
 
         current_aps = aps
+        if first_aperture_template is None:
+            first_aperture_template = _ApertureTemplate(
+                apertures=aps,
+                header=hdr.copy(),
+                side=side,
+                exposure_path=path,
+            )
         _aperture_to_json(ap_path, aps)
-        plot_apertures(img, aps, diag_dir / f"{path.stem}_aperture.png", title=f"{exposure_label}: aperture", show=False)
+        plot_apertures(
+            img,
+            aps,
+            diag_dir / f"{path.stem}_aperture.png",
+            title=f"{exposure_label}: aperture",
+            show=False,
+            wavelength_controller=white_light_controller,
+        )
 
         counts, sigma = _extract_counts_with_uncert(cube, uncert, flags, aps, label=exposure_label)
+        counts, sigma, exposure_time, exposure_time_keyword, spectrum_units = (
+            _normalize_extracted_spectrum_for_product(
+                product_type,
+                hdr,
+                counts,
+                sigma,
+                label=exposure_label,
+            )
+        )
+        if exposure_time is not None:
+            print(
+                f"[{exposure_label}] Normalized icubed spectrum and uncertainty "
+                f"by {exposure_time:g} s from {exposure_time_keyword}."
+            )
         lam, counts, sigma = _trim_side_arrays(side, lam, counts, sigma)
         spec_path = spectra_dir / f"{path.stem}_counts.flm"
-        _save_spectrum(spec_path, lam, counts, sigma, "counts")
+        spectrum_header = "count_rate_e_per_s" if product_type == "icubed" else "native_icubes_flux"
+        _save_spectrum(spec_path, lam, counts, sigma, spectrum_header)
         spectra_for_coadd.append((lam, counts, sigma))
         extracted.append(
             ExposureSpectrum(
@@ -1141,6 +2341,20 @@ def _extract_side(
                 spectrum_path=str(spec_path),
                 aperture_path=str(ap_path),
                 airmass=get_airmass_from_header(hdr),
+                exposure_time_seconds=exposure_time,
+                exposure_time_keyword=exposure_time_keyword,
+                spectrum_units=spectrum_units,
+                cr_status=str(cr_info.get("status")),
+                cr_cleaned_path=cr_info.get("cleaned_path") if cr_info.get("cleaned_path") is not None else None,
+                cr_mask_path=cr_info.get("mask_path") if cr_info.get("mask_path") is not None else None,
+                cr_nvoxels=int(cr_info["nvoxels"]) if cr_info.get("nvoxels") is not None else None,
+                cr_fraction=float(cr_info["fraction"]) if cr_info.get("fraction") is not None else None,
+                cr_diagnostics=dict(cr_info.get("diagnostics", {})),
+                cr_runtime_seconds=(
+                    float(cr_info["runtime_seconds"])
+                    if cr_info.get("runtime_seconds") is not None
+                    else None
+                ),
             )
         )
         print(f"Extracted {exposure_label} -> {spec_path}")
@@ -1154,27 +2368,155 @@ def _extract_side(
         maxiters=COADD_CLIP_MAXITERS,
         show=show_coadd_diagnostic,
     )
+    spectral_cr_state: Dict[str, object] = {
+        "enabled": bool(spectral_cr_review),
+        "config": asdict(spectral_cr_config),
+        "resolving_power": None,
+        "candidate_count": 0,
+        "removed_count": 0,
+    }
+    if spectral_cr_review:
+        if not resolving_power_estimates:
+            print(
+                f"[1D CR {side}] WARNING: Could not derive resolving power from "
+                "BGRATNAM/RGRATNAM and IFUNAM; skipping narrow-line review. "
+                "Use --spectral-cr-resolving-power to supply it explicitly."
+            )
+            spectral_cr_state["status"] = "skipped_no_resolving_power"
+        else:
+            estimate_values = np.array(
+                [item.value for item in resolving_power_estimates],
+                dtype=float,
+            )
+            resolving_power = float(np.median(estimate_values))
+            representative = min(
+                resolving_power_estimates,
+                key=lambda item: abs(item.value - resolving_power),
+            )
+            if not np.allclose(estimate_values, resolving_power, rtol=0.01, atol=0.0):
+                print(
+                    f"[1D CR {side}] WARNING: Exposure resolving-power estimates differ "
+                    f"({estimate_values.tolist()}); using median R={resolving_power:g}."
+                )
+            qualifier = "approximately " if representative.approximate else ""
+            print(
+                f"[1D CR {side}] Resolving power: {qualifier}R={resolving_power:g} "
+                f"from grating={representative.grating}, slicer={representative.slicer} "
+                f"({representative.source})."
+            )
+            detection = detect_cr_like_narrow_features(
+                lam_c,
+                counts_c,
+                sigma_c,
+                resolving_power=resolving_power,
+                config=spectral_cr_config,
+            )
+            candidate_count = len(detection.candidates)
+            print(
+                f"[1D CR {side}] Found {candidate_count} candidate"
+                f"{'s' if candidate_count != 1 else ''} with absolute S/N above "
+                f"{spectral_cr_config.detection_sigma:g} sigma with FWHM below "
+                f"{spectral_cr_config.max_lsf_fraction:g} of the expected LSF."
+            )
+            review_path = coadd_dir / f"{object_dir.name}_{side}_spectral_cr_review.json"
+            pre_review_path: Optional[Path] = None
+            summary_path: Optional[Path] = None
+            decisions: List[Dict[str, object]] = []
+            original_counts = counts_c.copy()
+            if candidate_count:
+                pre_review_path = (
+                    coadd_dir
+                    / f"{object_dir.name}_{side}_counts_coadd_before_spectral_cr.flm"
+                )
+                _save_spectrum(
+                    pre_review_path,
+                    lam_c,
+                    counts_c,
+                    sigma_c,
+                    "counts_coadd_before_spectral_cr",
+                )
+                counts_c, sigma_c, decisions = _review_spectral_cr_candidates(
+                    f"{object_dir.name} {side} resolving-power CR review",
+                    lam_c,
+                    counts_c,
+                    sigma_c,
+                    detection,
+                )
+                summary_path = (
+                    diag_dir / f"{object_dir.name}_{side}_spectral_cr_review.png"
+                )
+                _plot_spectral_cr_review_summary(
+                    summary_path,
+                    f"{object_dir.name} {side}: resolving-power CR review",
+                    lam_c,
+                    original_counts,
+                    counts_c,
+                    sigma_c,
+                    decisions,
+                )
+            removed_count = sum(
+                decision.get("decision") == "removed" for decision in decisions
+            )
+            review_report = {
+                "status": "completed",
+                "side": side,
+                "resolving_power": resolving_power,
+                "resolving_power_estimates": [
+                    asdict(item) for item in resolving_power_estimates
+                ],
+                "config": asdict(spectral_cr_config),
+                "candidate_count": candidate_count,
+                "removed_count": int(removed_count),
+                "pre_review_spectrum": (
+                    str(pre_review_path) if pre_review_path is not None else None
+                ),
+                "summary_diagnostic": (
+                    str(summary_path) if summary_path is not None else None
+                ),
+                "decisions": decisions,
+            }
+            _write_extraction_state(review_path, review_report)
+            spectral_cr_state.update(review_report)
+            spectral_cr_state["review_file"] = str(review_path)
+            print(
+                f"[1D CR {side}] Removed {removed_count}/{candidate_count} reviewed "
+                f"candidates; decisions -> {review_path}"
+            )
+            if summary_path is not None:
+                print(f"[1D CR {side}] Saved review diagnostic -> {summary_path}")
+
     out_path = coadd_dir / f"{object_dir.name}_{side}_counts_coadd.flm"
-    _save_spectrum(out_path, lam_c, counts_c, sigma_c, "counts_coadd")
+    coadd_header = "count_rate_e_per_s_coadd" if product_type == "icubed" else "native_icubes_flux_coadd"
+    _save_spectrum(out_path, lam_c, counts_c, sigma_c, coadd_header)
     np.savetxt(coadd_dir / f"{object_dir.name}_{side}_nexp.txt", np.c_[lam_c, n_good], header="lambda_A  n_exposures_used")
 
     state_path = object_dir / "extraction_state.json"
-    state = {}
-    if state_path.exists():
-        with open(state_path, "r", encoding="utf-8") as f:
-            state = json.load(f)
+    state = _load_extraction_state(state_path)
     state.setdefault("sides", {})[side] = {
         "coadd_counts": str(out_path),
         "coadd_clip_sigma": coadd_clip_sigma,
         "coadd_clip_maxiters": COADD_CLIP_MAXITERS,
+        "cr_reject": bool(cr_reject),
+        "redo_cr_reject": bool(redo_cr_reject),
+        "cr_config": config_to_dict(cr_config),
+        "product_type": product_type,
+        "input_spectrum_units": (
+            ICUBED_SPECTRUM_UNITS if product_type == "icubed" else ICUBES_SPECTRUM_UNITS
+        ),
+        "exposure_normalized": product_type == "icubed",
+        "spectral_cr_review": spectral_cr_state,
         "exposures": [asdict(item) for item in extracted],
     }
-    with open(state_path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+    _write_extraction_state(state_path, state)
 
-    print(f"Coadded {side} 1D spectra with sigma={coadd_clip_sigma:g} -> {out_path}")
+    print(f"Coadded {side} {product_type} 1D spectra with sigma={coadd_clip_sigma:g} -> {out_path}")
     print(f"Saved {side} coadd diagnostic -> {coadd_diag_path}")
-    return out_path
+    if first_aperture_template is None:
+        raise RuntimeError(f"No approved {side} aperture was available after extraction")
+    return _SideExtractionResult(
+        coadd_path=out_path,
+        aperture_template=first_aperture_template,
+    )
 
 
 def _load_txt_spectrum(path: Path) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
@@ -1187,11 +2529,17 @@ def _load_txt_spectrum(path: Path) -> Tuple[np.ndarray, np.ndarray, Optional[np.
     return lam, y, sigma
 
 
-def _existing_fluxcal_path(object_dir: Path, side: str) -> Path:
+def _existing_fluxcal_path(
+    object_dir: Path,
+    side: str,
+) -> Path:
     return object_dir / "fluxcal" / f"{object_dir.name}_{side}_fluxcal.flm"
 
 
-def _find_existing_fluxcal_path(object_dir: Path, side: str) -> Optional[Path]:
+def _find_existing_fluxcal_path(
+    object_dir: Path,
+    side: str,
+) -> Optional[Path]:
     path = _existing_fluxcal_path(object_dir, side)
     if not path.exists():
         legacy_path = object_dir / "fluxcal" / f"{object_dir.name}_{side}_fluxcal.txt"
@@ -1202,7 +2550,10 @@ def _find_existing_fluxcal_path(object_dir: Path, side: str) -> Optional[Path]:
     return path
 
 
-def _load_existing_fluxcal_side(object_dir: Path, side: str) -> Optional[Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]]:
+def _load_existing_fluxcal_side(
+    object_dir: Path,
+    side: str,
+) -> Optional[Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]]:
     path = _find_existing_fluxcal_path(object_dir, side)
     if path is None:
         return None
@@ -1285,18 +2636,32 @@ def _join_science_flux_sides(
     return True
 
 
-def join_existing_science_sides(object_dir: Path, *, show_plots: bool = False) -> None:
+def join_existing_science_sides(
+    object_dir: Path,
+    *,
+    show_plots: bool = False,
+) -> None:
     object_dir = object_dir.expanduser().resolve()
     flux_paths: Dict[str, Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]] = {}
     for side in ("BLUE", "RED"):
         existing = _load_existing_fluxcal_side(object_dir, side)
         if existing is None:
-            print(f"No existing {side} flux-calibrated spectrum found at {_existing_fluxcal_path(object_dir, side)}")
+            print(
+                f"No existing {side} flux-calibrated spectrum found at "
+                f"{_existing_fluxcal_path(object_dir, side)}"
+            )
         else:
             flux_paths[side] = existing
-            print(f"Loaded existing flux-calibrated {side} spectrum -> {_find_existing_fluxcal_path(object_dir, side)}")
+            print(
+                f"Loaded existing flux-calibrated {side} spectrum -> "
+                f"{_find_existing_fluxcal_path(object_dir, side)}"
+            )
 
-    if not _join_science_flux_sides(object_dir, flux_paths, show_plots=show_plots):
+    if not _join_science_flux_sides(
+        object_dir,
+        flux_paths,
+        show_plots=show_plots,
+    ):
         raise FileNotFoundError(
             f"Join-only requires both BLUE and RED fluxcal spectra under {object_dir / 'fluxcal'}"
         )
@@ -1336,6 +2701,7 @@ def _build_standard_calibrations(
     calib_dir: Path,
     *,
     show_plots: bool,
+    product_type: str,
 ) -> None:
     standard_name = object_dir.name
     registry = _load_registry(calib_dir)
@@ -1355,8 +2721,12 @@ def _build_standard_calibrations(
         object_diag_dir.mkdir(parents=True, exist_ok=True)
         object_flux_dir.mkdir(parents=True, exist_ok=True)
         object_final_dir.mkdir(parents=True, exist_ok=True)
-        spline_points_path = outdir / f"continuum_spline_points_{side}.txt"
-        object_spline_points_path = object_diag_dir / f"continuum_spline_points_{side}.txt"
+        # Use a distinct filename so legacy control points fitted to integrated
+        # icubed electrons cannot be reused against the new electron/s spectra.
+        spline_suffix = "_electron_per_s" if product_type == "icubed" else ""
+        spline_name = f"continuum_spline_points_{side}{spline_suffix}.txt"
+        spline_points_path = outdir / spline_name
+        object_spline_points_path = object_diag_dir / spline_name
         initial_points = _load_spline_points([object_spline_points_path, spline_points_path])
 
         continuum, sens, spline_points = interactive_continuum_spline(
@@ -1369,8 +2739,13 @@ def _build_standard_calibrations(
             initial_points=initial_points,
         )
         _save_spline_points([spline_points_path, object_spline_points_path], spline_points)
-        lam_cal_std, flux_cal_std = apply_sensitivity(lam_std, sens, lam_std, counts)
-        sigma_flux_std = np.abs(sens) * sigma_counts if sigma_counts is not None else None
+        lam_cal_std, flux_cal_std, sigma_flux_std = apply_sensitivity_with_uncertainty(
+            lam_std,
+            sens,
+            lam_std,
+            counts,
+            sigma_counts,
+        )
         with np.errstate(divide="ignore", invalid="ignore"):
             ratio = flux_ref / continuum
 
@@ -1393,6 +2768,12 @@ def _build_standard_calibrations(
             "continuum_spline_points_file": str(spline_points_path),
             "sensitivity_file": str(sens_path),
             "reference_units": FLUX_UNIT_LABEL,
+            "product_type": product_type,
+            "input_spectrum_units": (
+                ICUBED_SPECTRUM_UNITS if product_type == "icubed" else ICUBES_SPECTRUM_UNITS
+            ),
+            "exposure_normalized": product_type == "icubed",
+            "calibration_schema_version": CALIBRATION_SCHEMA_VERSION,
         }
 
         tell_path = None
@@ -1533,7 +2914,11 @@ def _build_standard_calibrations(
 
         registry["standards"] = [
             old for old in registry["standards"]
-            if not (old.get("standard_name") == standard_name and old.get("side") == side)
+            if not (
+                old.get("standard_name") == standard_name
+                and old.get("side") == side
+                and _registry_product_type(old) == product_type
+            )
         ]
         registry["standards"].append(item)
         print(f"Saved {side} calibration -> {sens_path}")
@@ -1550,6 +2935,7 @@ def _apply_science_calibrations(
     calib_dir: Path,
     *,
     show_plots: bool,
+    product_type: str,
 ) -> None:
     flux_paths: Dict[str, Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]] = {}
     flux_dir = object_dir / "fluxcal"
@@ -1558,7 +2944,7 @@ def _apply_science_calibrations(
     final_dir.mkdir(parents=True, exist_ok=True)
 
     for side, counts_path in coadd_paths.items():
-        cal = _choose_calibration(calib_dir, side)
+        cal = _choose_calibration(calib_dir, side, product_type)
         if cal is None:
             print(f"No {side} calibration selected; leaving counts-only product.")
             continue
@@ -1576,11 +2962,13 @@ def _apply_science_calibrations(
                 f"to {FLUX_UNIT_LABEL}."
             )
             sens = sens * unit_scale
-        lam_flux, flux = apply_sensitivity(lam_sens, sens, lam_counts, counts)
-        sigma_flux = None
-        if sigma_counts is not None:
-            sigma_interp = np.interp(lam_sens, lam_counts, sigma_counts, left=np.nan, right=np.nan)
-            sigma_flux = np.abs(sens) * sigma_interp
+        lam_flux, flux, sigma_flux = apply_sensitivity_with_uncertainty(
+            lam_sens,
+            sens,
+            lam_counts,
+            counts,
+            sigma_counts,
+        )
 
         if side == "RED" and cal.get("telluric_file"):
             tell = np.loadtxt(cal["telluric_file"], comments="#")
@@ -1702,9 +3090,16 @@ def _apply_science_calibrations(
         existing = _load_existing_fluxcal_side(object_dir, side)
         if existing is not None:
             flux_paths[side] = existing
-            print(f"Reusing existing flux-calibrated {side} spectrum for join -> {_find_existing_fluxcal_path(object_dir, side)}")
+            print(
+                f"Reusing existing flux-calibrated {side} spectrum for join -> "
+                f"{_find_existing_fluxcal_path(object_dir, side)}"
+            )
 
-    if _join_science_flux_sides(object_dir, flux_paths, show_plots=show_plots):
+    if _join_science_flux_sides(
+        object_dir,
+        flux_paths,
+        show_plots=show_plots,
+    ):
         return
 
     if len(flux_paths) == 1:
@@ -1730,6 +3125,12 @@ def extract_object(
     side: str = "both",
     show_plots: bool = False,
     redo_apertures: bool = False,
+    cr_reject: bool = True,
+    redo_cr_reject: bool = False,
+    cr_config: Optional[CosmicRayRejectionConfig] = None,
+    spectral_cr_review: bool = True,
+    spectral_cr_resolving_power: Optional[float] = None,
+    spectral_cr_config: Optional[SpectralCRConfig] = None,
     join_only: bool = False,
 ) -> None:
     object_dir = object_dir.expanduser().resolve()
@@ -1739,7 +3140,10 @@ def extract_object(
     if join_only:
         if standard is True:
             raise ValueError("--join-only is only valid for science reductions")
-        join_existing_science_sides(object_dir, show_plots=show_plots)
+        join_existing_science_sides(
+            object_dir,
+            show_plots=show_plots,
+        )
         return
 
     if standard is None:
@@ -1755,23 +3159,73 @@ def extract_object(
     else:
         raise ValueError("side must be one of: blue, red, both")
 
-    coadd_paths: Dict[str, Path] = {}
+    if cr_config is None:
+        cr_config = CosmicRayRejectionConfig()
+    if spectral_cr_config is None:
+        spectral_cr_config = SpectralCRConfig()
+
+    product_types = set()
     for side_name in sides:
-        path = _extract_side(
+        detected_type, files = _side_product_files(object_dir, side_name)
+        if files:
+            product_types.add(detected_type)
+    if not product_types:
+        raise FileNotFoundError(f"No requested-side *_icubed.fits or *_icubes.fits files found under {object_dir}")
+    if len(product_types) != 1:
+        raise ValueError(
+            f"Requested sides contain mixed cube products: {sorted(product_types)}. "
+            "All standards and science targets must use the same cube type."
+        )
+    product_type = next(iter(product_types))
+    print(f"[{object_dir.name}] Input cube product: *_{product_type}.fits")
+
+    coadd_paths: Dict[str, Path] = {}
+    aperture_template: Optional[_ApertureTemplate] = None
+    aperture_template_from_current_run = False
+    if len(sides) == 1 and not redo_apertures:
+        opposite_side = "RED" if sides[0] == "BLUE" else "BLUE"
+        aperture_template = _saved_aperture_template(object_dir, opposite_side)
+    for side_name in sides:
+        result = _extract_side(
             object_dir,
             side_name,
             show_plots=show_plots,
             redo_apertures=redo_apertures,
+            cr_reject=cr_reject,
+            redo_cr_reject=redo_cr_reject,
+            cr_config=cr_config,
+            product_type=product_type,
+            spectral_cr_review=(
+                bool(spectral_cr_review) and ((not standard) or show_plots)
+            ),
+            spectral_cr_resolving_power=spectral_cr_resolving_power,
+            spectral_cr_config=spectral_cr_config,
+            initial_aperture_template=aperture_template,
+            prefer_initial_aperture_template=aperture_template_from_current_run,
             show_coadd_diagnostic=(not standard) or show_plots,
         )
-        if path is not None:
-            coadd_paths[side_name] = path
+        if result is not None:
+            coadd_paths[side_name] = result.coadd_path
+            aperture_template = result.aperture_template
+            aperture_template_from_current_run = True
 
     if not coadd_paths:
-        raise FileNotFoundError(f"No requested-side *_icubes.fits files found under {object_dir}")
+        raise FileNotFoundError(f"No requested-side cube files found under {object_dir}")
 
     resolved_calib_dir = _project_calib_dir(object_dir, calib_dir)
     if standard:
-        _build_standard_calibrations(object_dir, coadd_paths, resolved_calib_dir, show_plots=show_plots)
+        _build_standard_calibrations(
+            object_dir,
+            coadd_paths,
+            resolved_calib_dir,
+            show_plots=show_plots,
+            product_type=product_type,
+        )
     else:
-        _apply_science_calibrations(object_dir, coadd_paths, resolved_calib_dir, show_plots=show_plots)
+        _apply_science_calibrations(
+            object_dir,
+            coadd_paths,
+            resolved_calib_dir,
+            show_plots=show_plots,
+            product_type=product_type,
+        )
