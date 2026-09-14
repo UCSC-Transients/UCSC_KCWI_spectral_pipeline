@@ -1,18 +1,20 @@
 # KCWI Spectral Reduction Pipeline Instructions
 
-This guide describes the KCWI spectral reduction workflow for KOA/KCWI DRP Level 2 `*_icubes.fits` files.
+This pipeline organizes KCWI cube products, extracts standard-star and science
+spectra, applies flux and RED telluric calibrations, and writes final 1D spectra.
+It accepts either `*_icubes.fits` or `*_icubed.fits` products.
 
-The expected workflow is:
+For quicklook reduction, use Level 1 `*_icubed.fits` files which are available 
+on KOA within minutes of observation.
 
-1. Put all downloaded KOA `*_icubes.fits` files in one input directory.
-2. Organize them into a project directory grouped by object and side.
-3. Extract one or more standard stars to build master calibrations.
-4. Extract science targets object by object.
-5. Re-run individual sides or apertures as needed without affecting other objects.
+Use one cube type throughout a project. The pipeline rejects mixed `icubes` and
+`icubed` inputs because standards and science targets must be processed
+consistently. See [Cube products and exposure time](#cube-products-and-exposure-time)
+for the difference between the two products.
 
-## Dependencies
+## Quick start
 
-The pipeline uses:
+Run commands from the pipeline repository with a Python environment containing:
 
 ```text
 numpy
@@ -22,29 +24,32 @@ photutils
 matplotlib
 ```
 
-The user should run the pipeline from a Python environment where these packages are installed.
+The usual reduction order is:
 
-## 1. Organize KOA Downloads
+1. Organize the downloaded cubes into a project.
+2. Extract the relevant standard stars.
+3. Extract the science targets.
+4. Inspect the final `.flm` spectrum, PNG, and diagnostics.
 
-Start with a directory containing all downloaded Level 2 `*_icubes.fits` files.
+### 1. Organize the cubes
+
+Place all cubes for one project under one input directory, then run:
 
 ```bash
-python run_kcwi_reduction.py organize /path/to/koa_download --project /path/to/kcwi_project
+python run_kcwi_reduction.py organize /path/to/koa_download \
+  --project /path/to/kcwi_project
 ```
 
-By default, files are symlinked into the project. This is usually preferred because it does not duplicate large FITS files.
+The default mode creates symbolic links, avoiding duplication of large FITS
+files. To copy or move the files instead, use `--mode copy` or `--mode move`.
+Use `move` only when the source files should actually be relocated.
 
-The project structure will look like:
+The resulting project begins with:
 
 ```text
 kcwi_project/
   objects/
-    OBJECT_A/
-      BLUE/
-        *_icubes.fits
-      RED/
-        *_icubes.fits
-    OBJECT_B/
+    OBJECT_NAME/
       BLUE/
       RED/
   calibrations/
@@ -52,593 +57,527 @@ kcwi_project/
   project_manifest.json
 ```
 
-Alternative organization modes:
+Object names and sides are read from FITS metadata. The input directory may be
+nested; the organizer searches it recursively.
+
+### 2. Extract the standard stars
+
+Process standards before science targets so that sensitivity functions are
+available. Run the side or sides covered by each standard:
 
 ```bash
-python run_kcwi_reduction.py organize /path/to/koa_download --project /path/to/kcwi_project --mode symlink
-python run_kcwi_reduction.py organize /path/to/koa_download --project /path/to/kcwi_project --mode copy
-python run_kcwi_reduction.py organize /path/to/koa_download --project /path/to/kcwi_project --mode move
+python run_kcwi_reduction.py extract \
+  /path/to/kcwi_project/objects/STD_OBJECT \
+  --standard --side blue
+
+python run_kcwi_reduction.py extract \
+  /path/to/kcwi_project/objects/STD_OBJECT \
+  --standard --side red
 ```
 
-Use `move` only if you really want the original KOA files moved.
+Use `--side both` if reducing both sides together. If
+`--side` is omitted, `both` is used.
 
-## 2. Extract a Standard Star
+During the run, the pipeline will:
 
-From the pipeline repository directory, pass the standard star object directory to `extract`:
+1. Create or reuse cosmic ray (CR)-cleaned cubes.
+2. Ask you to define or approve apertures.
+3. Extract and coadd the exposures.
+4. Ask which built-in flux standard corresponds to the object.
+5. Open the continuum/sensitivity editor.
+6. Save a calibration entry for each completed side.
+7. Build a RED telluric template when processing the RED side.
 
-Extract only the red side:
+Calibration products are saved under:
+
+```text
+kcwi_project/calibrations/STD_OBJECT/SIDE/
+```
+
+The standard's processed spectrum and diagnostics are also retained in its
+object directory. See [Standard continuum editor](#standard-continuum-editor)
+and [Flux and telluric calibration](#flux-and-telluric-calibration) for details.
+
+### 3. Extract a science target
+
+To process both sides:
 
 ```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/STD_OBJECT_NAME --standard --side red
+python run_kcwi_reduction.py extract \
+  /path/to/kcwi_project/objects/SCIENCE_OBJECT \
+  --science --side both
 ```
 
-Extract only the blue side:
+To process only one side:
 
 ```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/STD_OBJECT_NAME --standard --side blue
+python run_kcwi_reduction.py extract \
+  /path/to/kcwi_project/objects/SCIENCE_OBJECT \
+  --science --side red
 ```
 
-Extract both sides:
+For each requested side, the pipeline will:
 
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/STD_OBJECT_NAME --standard --side both
-```
+1. Create or reuse CR-cleaned cubes.
+2. Define, propagate, or review apertures for every exposure.
+3. Extract the 1D spectra and open the coadd review window.
+4. Review CR-like narrow features in the coadd.
+5. Ask which compatible standard calibration to use.
+6. Apply sensitivity calibration and, for RED, review telluric alignment.
+7. Save a side-level flux-calibrated spectrum.
 
-If `--side` is omitted, the default is `both`.
+When both side-level spectra are available, the pipeline opens the BLUE/RED
+scaling window and then writes a combined spectrum. The sides have no spectral
+overlap; the final file is a wavelength-sorted concatenation of the independently
+scaled sides.
 
-During standard extraction, the pipeline will:
+### 4. Locate the final products
 
-- extract every `*_icubes.fits` exposure separately;
-- ask for target/background apertures;
-- optionally reuse and review apertures for later exposures;
-- coadd the extracted 1D spectra with sigma clipping;
-- ask for the AB standard-star identity from `kcwi_pipeline/abcalc.py`;
-- show the extracted standard spectrum and reference flux;
-- let you add/delete/move spline points for the continuum fit;
-- load previously saved continuum spline points when the same standard/side is redone;
-- for RED standards, exclude telluric windows from the continuum fit;
-- build sensitivity functions;
-- for RED standards, build a telluric template;
-- save calibration products in the master project calibration directory;
-- also save object-local standard diagnostics and processed spectra.
-
-Master calibration outputs are saved under:
+For a two-sided science reduction:
 
 ```text
-/path/to/kcwi_project/calibrations/STD_OBJECT_NAME/SIDE/
+objects/SCIENCE_OBJECT/final/SCIENCE_OBJECT_BLUE+RED_spectrum.flm
+objects/SCIENCE_OBJECT/final/SCIENCE_OBJECT_BLUE+RED_spectrum.png
 ```
 
-Object-local standard outputs are saved under:
+For a one-sided reduction:
 
 ```text
-objects/STD_OBJECT_NAME/extracted/SIDE/
-objects/STD_OBJECT_NAME/coadded_spectra/
-objects/STD_OBJECT_NAME/diagnostics/SIDE/
-objects/STD_OBJECT_NAME/diagnostics/SIDE/standard_calibration/
-objects/STD_OBJECT_NAME/final/
+objects/SCIENCE_OBJECT/final/SCIENCE_OBJECT_BLUE_spectrum.flm
+objects/SCIENCE_OBJECT/final/SCIENCE_OBJECT_BLUE_spectrum.png
+objects/SCIENCE_OBJECT/final/SCIENCE_OBJECT_RED_spectrum.flm
+objects/SCIENCE_OBJECT/final/SCIENCE_OBJECT_RED_spectrum.png
 ```
 
-Standard processed spectra are ASCII `.flm` files:
+Final PNGs show the 1-sigma uncertainty as gray shading when uncertainty is
+available. See [Outputs and units](#outputs-and-units) for the full directory
+layout and file format.
 
-```text
-objects/STD_OBJECT_NAME/final/STD_OBJECT_NAME_BLUE_standard_processed.flm
-objects/STD_OBJECT_NAME/final/STD_OBJECT_NAME_RED_standard_processed.flm
-```
+## Interactive windows
 
-The corresponding PNGs include uncertainty shading if uncertainty is available:
+Required interactive windows open even without `--show-plots`. That option
+also displays additional diagnostics.
 
-```text
-objects/STD_OBJECT_NAME/final/STD_OBJECT_NAME_BLUE_standard_processed.png
-objects/STD_OBJECT_NAME/final/STD_OBJECT_NAME_RED_standard_processed.png
-```
+### Aperture editor
 
-Accepted standard-star continuum spline points are saved in both the calibration directory and the object-local diagnostics directory:
-
-```text
-calibrations/STD_OBJECT_NAME/SIDE/continuum_spline_points_SIDE.txt
-objects/STD_OBJECT_NAME/diagnostics/SIDE/standard_calibration/continuum_spline_points_SIDE.txt
-```
-
-When the standard side is rerun, these points are loaded as the initial spline points. The user can accept them, move them, add/delete points, or reset to automatically generated defaults.
-
-## 3. Extract a Science Object
-
-From the pipeline repository directory, pass the science object directory to `extract`:
-
-Extract both sides:
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT_NAME --science --side both
-```
-
-Extract only one side:
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT_NAME --science --side blue
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT_NAME --science --side red
-```
-
-During science extraction, the pipeline will:
-
-- extract each exposure separately;
-- coadd the 1D spectra with sigma clipping;
-- save and display a coadd diagnostic plot;
-- ask which standard calibration to use for each side;
-- apply sensitivity functions;
-- apply the telluric correction;
-- save side-level flux-calibrated spectra;
-- if both sides are available, run the join/scale/approve step;
-- save the final spectrum as `.flm` and `.png`.
-
-Science outputs are saved under:
-
-```text
-objects/SCIENCE_OBJECT_NAME/apertures/
-objects/SCIENCE_OBJECT_NAME/extracted/
-objects/SCIENCE_OBJECT_NAME/coadded_spectra/
-objects/SCIENCE_OBJECT_NAME/fluxcal/
-objects/SCIENCE_OBJECT_NAME/final/
-objects/SCIENCE_OBJECT_NAME/diagnostics/
-objects/SCIENCE_OBJECT_NAME/extraction_state.json
-```
-
-Final science spectra:
-
-```text
-objects/SCIENCE_OBJECT_NAME/final/SCIENCE_OBJECT_NAME_BLUE+RED_spectrum.flm
-objects/SCIENCE_OBJECT_NAME/final/SCIENCE_OBJECT_NAME_BLUE+RED_spectrum.png
-```
-
-If only one side was extracted:
-
-```text
-objects/SCIENCE_OBJECT_NAME/final/SCIENCE_OBJECT_NAME_BLUE_spectrum.flm
-objects/SCIENCE_OBJECT_NAME/final/SCIENCE_OBJECT_NAME_RED_spectrum.flm
-```
-
-## 4. Aperture Editing Controls
-
-White-light images are shown in two panels:
+The aperture display has two views of the same white-light image:
 
 - left: original aspect ratio;
-- right: y-compressed by a factor of 3 for easier visual comparison to sky charts.
+- right: vertically compressed for easier visual comparison with sky charts.
 
-Both panels use the same image coordinates. Apertures can be drawn, moved, and resized from either panel.
+Both panels use the same image coordinates. You can draw or drag from either
+panel. Display controls are:
 
-The white-light display includes real-time contrast controls:
+- `Wavelength (A)`: changes the wavelength interval used for the white-light
+  image only; extraction still uses the full configured side range;
+- `Low %` and `High %`: adjust image contrast;
+- `Reset`: restores the full wavelength interval and 5--99% contrast.
 
-- `Low %` slider: lower percentile cut;
-- `High %` slider: upper percentile cut;
-- `Reset`: return to 5-99 percent scaling.
-
-Aperture drawing/editing keys:
-
-```text
-m      move mode
-e      resize mode
-a      accept aperture
-Enter  accept aperture
-r      redraw from scratch, where available
-q      cancel/quit
-```
-
-General aperture review prompt:
+When defining a new aperture, select the initial target and background shapes
+in the terminal and draw them in the image. All new, saved, propagated, and
+cross-side aperture proposals then open in the same editor with:
 
 ```text
-a   approve apertures
-rt  redraw target
-st  change target shape
-rb  redraw background
-sb  change background shape
-t   move/resize target
-b   move/resize background
-p   edit numeric parameters
-q   quit
+Accept
+Move target
+Resize target
+Target shape...
+Move background
+Resize background
+Background shape...
+Enter values...
+Cancel
 ```
 
-When setting or editing the background aperture, the target aperture is shown for reference.
+Choose a move or resize mode, then drag the aperture in either image panel.
+`Accept` immediately continues the pipeline; there is no additional terminal
+approval prompt.
 
-## 5. Continuum Spline Controls for Standards
-
-The standard-star spline plot is used to define the observed continuum for sensitivity creation.
-
-Controls:
+Keyboard shortcuts in the combined editor are:
 
 ```text
-left-click       add point
-drag marker      move point
-right-click      delete nearest point
-z                zoom-box mode
-o                original zoom
-a                accept spline
-Enter            accept spline
-r                reset spline points
-q                quit
+a or Enter  accept
+t           move target
+b           move background
+m           move the active aperture
+e           resize the active aperture
+q           cancel
 ```
 
-The telluric windows are shaded and excluded from the continuum fit:
+The first approved aperture is proposed for subsequent exposures. When both
+sides are processed, it is transformed through the celestial WCS and proposed
+for the other side. Every proposal remains editable before acceptance. Saved
+apertures are stored under `apertures/SIDE/`; use `--redo-apertures` to ignore
+them and start again.
 
+### Coadd review
 
-This preserves the telluric absorption troughs so the telluric template is built correctly.
+The science coadd window shows the offset individual exposures, the current
+coadd and uncertainty, and the number of accepted exposures at each wavelength.
+Use the `Clip sigma` slider to change rejection strength, `Reset` to return to
+the default, and `Approve` (or `a`/Enter) to continue. Pressing `q` aborts the
+review.
 
-## 6. Join and Approve Controls
+The approved clipping threshold is recorded in `extraction_state.json`. See
+[Extraction, coaddition, and uncertainty](#extraction-coaddition-and-uncertainty)
+for the calculation.
 
-When both BLUE and RED sides are available for a science object, the pipeline opens a join approval plot.
+### Narrow-feature CR review
 
-Controls:
+After the science coadd, the pipeline proposes unusually narrow positive or
+negative features for review. In each candidate window:
+
+- the upper panel shows the candidate and proposed replacement pixels;
+- the lower panel shows the full spectrum and highlights the upper panel's
+  wavelength range;
+- `Accept line` keeps the feature;
+- `Remove as CR` replaces the highlighted pixels by interpolation.
+
+After the last candidate, inspect the full result and choose `Accept result` or
+`Redo review`.
+
+Keyboard shortcuts are:
 
 ```text
-Blue scale slider  multiply BLUE spectrum by 0.1-10
-Red scale slider   multiply RED spectrum by 0.1-10
-Reset              reset both scales to 1
-Approve            approve current scaling
-a      approve current scaling
-Enter  approve current scaling
-z      save current zoomed view
-q      abort
+Candidate review: a or Enter keeps the line
+Candidate review: r, Backspace, or Delete removes it
+Final review:     a or Enter accepts; r starts over
 ```
 
-If you close the plot without approving, the terminal still offers fallback scaling choices:
+Use `--no-spectral-cr-review` to skip this stage. Detection controls are listed
+under [Useful rerun and override options](#useful-rerun-and-override-options),
+with algorithm details in [Cosmic-ray treatment](#cosmic-ray-treatment).
+
+### Standard continuum editor
+
+This window defines the observed standard-star continuum used to construct the
+sensitivity function. Previously accepted points are loaded when that standard
+and side are rerun.
 
 ```text
-a   approve current scaling
-1   multiply RED by factor
-2   multiply BLUE by factor
-3   set RED scale absolute
-4   set BLUE scale absolute
-q   abort pipeline
+left-click     add a point
+drag marker    move a point
+right-click    delete the nearest point
+z              enter zoom-box mode
+o              restore the original view
+r              reset to automatic points
+a or Enter     accept
+q              quit
 ```
 
-The final joined spectrum uses the approved BLUE and RED scale factors.
+On RED standards, orange telluric regions are excluded from the continuum fit.
 
-## 7. Common Commands
+### RED telluric alignment
 
-### Organize New Data
+The science RED alignment window compares the science spectrum with the
+airmass-scaled telluric template in the O2 B and A bands. Move the `Shift (A)`
+slider until the features align, then click `Accept`. A positive shift moves the
+template redward.
 
-```bash
-python run_kcwi_reduction.py organize /path/to/koa_download --project /path/to/kcwi_project
-```
+If the standard or science airmass is unavailable, the pipeline warns and skips
+the telluric correction.
 
-### Organize by Copy Instead of Symlink
+### BLUE/RED scaling and acceptance
 
-```bash
-python run_kcwi_reduction.py organize /path/to/koa_download --project /path/to/kcwi_project --mode copy
-```
-
-### Extract a RED Standard
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/STD_OBJECT_NAME --standard --side red
-```
-
-### Extract a BLUE Standard
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/STD_OBJECT_NAME --standard --side blue
-```
-
-### Extract Both Sides of a Science Object
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT_NAME --science --side both
-```
-
-### Extract Only RED Science
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT_NAME --science --side red
-```
-
-### Extract Only BLUE Science
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT_NAME --science --side blue
-```
-
-### Redo Apertures
-
-Use this when you want to ignore saved apertures and redefine them.
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT_NAME --science --side red --redo-apertures
-```
-
-For a standard:
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/STD_OBJECT_NAME --standard --side red --redo-apertures
-```
-
-### Force Diagnostic Plots
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT_NAME --science --side both --show-plots
-```
-
-### Use a Calibration Directory Explicitly
-
-Normally the pipeline finds the project calibration directory automatically. To specify one:
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT_NAME --science --side both --calib-dir /path/to/kcwi_project/calibrations
-```
-
-### Redo One Side and Rebuild the Join
-
-If both sides were processed before, you can rerun one side. The pipeline will reuse the existing other side from `fluxcal/` and rerun the join approval.
-
-Redo RED only:
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT_NAME --science --side red
-```
-
-Redo BLUE only:
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT_NAME --science --side blue
-```
-
-The reused side is loaded from:
+The final join window keeps the BLUE and RED traces color-coded and provides:
 
 ```text
-fluxcal/SCIENCE_OBJECT_NAME_BLUE_fluxcal.flm
-fluxcal/SCIENCE_OBJECT_NAME_RED_fluxcal.flm
+Blue scale slider   multiply BLUE by 0.1--10
+Red scale slider    multiply RED by 0.1--10
+Reset               restore both scales to 1
+Approve             accept and continue
 ```
 
+You can also press `a`/Enter to approve, `z` to save the current zoom, or `q` to
+abort. If the window is closed without approval, equivalent choices are offered
+in the terminal and the window can be reopened.
 
-### Redo Only the BLUE+RED Scaling and Join
+The accepted factors are applied to flux and uncertainty and saved in:
 
-Use this when both side spectra already exist and you only want to adjust the relative BLUE/RED scaling again.
+```text
+final/SCIENCE_OBJECT_join_scale.txt
+```
+
+## Re-running work
+
+### Redo apertures
+
+Ignore saved apertures and define them again:
 
 ```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT_NAME --science --join-only
+python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/OBJECT \
+  --science --side red --redo-apertures
 ```
 
-This skips aperture extraction, 1D coaddition, flux calibration, and telluric correction. It loads:
+Replace `--science` with `--standard` for a standard star.
+
+### Rerun or disable cube-level CR rejection
+
+CR rejection is enabled by default. Valid cached `_crclean.fits` products are
+reused. To rerun rejection from the original cubes and replace the derived CR
+products:
+
+```bash
+python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/OBJECT \
+  --science --side red --redo-cr-reject
+```
+
+To extract directly from the original cubes without creating or reusing
+CR-cleaned cubes:
+
+```bash
+python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/OBJECT \
+  --science --side red --no-cr-reject
+```
+
+Use `--cr-workers 1` for serial detection or `--cr-workers N` for a specific
+worker count. The default, `0`, selects a safe automatic count.
+
+### Rerun one side
+
+Run a normal one-side extraction. If the other side already has a spectrum in
+`fluxcal/`, the pipeline reuses it and reopens the final scaling window:
+
+```bash
+python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT \
+  --science --side blue
+```
+
+### Redo only the BLUE/RED scaling
+
+When both side-level spectra already exist:
+
+```bash
+python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT \
+  --science --join-only
+```
+
+This skips extraction, coaddition, calibration, and telluric correction. It
+loads the two `fluxcal/*.flm` files and rewrites the joined products in `final/`.
+
+### Use a calibration directory explicitly
+
+The project calibration directory is normally found automatically. Override it
+with:
+
+```bash
+python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT \
+  --science --side both --calib-dir /path/to/kcwi_project/calibrations
+```
+
+### Useful rerun and override options
 
 ```text
-fluxcal/SCIENCE_OBJECT_NAME_BLUE_fluxcal.flm
-fluxcal/SCIENCE_OBJECT_NAME_RED_fluxcal.flm
+--show-plots                       display additional diagnostics
+--redo-apertures                   ignore saved aperture JSON files
+--no-cr-reject                     bypass cube-level CR cleaning
+--redo-cr-reject                   rebuild cube-level CR products
+--cr-workers N                     set CR detector process count
+--no-spectral-cr-review            skip coadded-spectrum CR review
+--spectral-cr-resolving-power R    override header-derived resolving power
+--spectral-cr-sigma S              set the candidate significance threshold
+--spectral-cr-max-lsf-fraction F   set the maximum candidate/LSF width ratio
+--join-only                        redo only BLUE/RED scaling and concatenation
 ```
 
-Then it opens the join scaling window and rewrites:
+For all cube-level CR tuning parameters and their current defaults, run:
+
+```bash
+python run_kcwi_reduction.py extract --help
+```
+
+## Outputs and units
+
+The main object directory is:
 
 ```text
-final/SCIENCE_OBJECT_NAME_BLUE+RED_spectrum.flm
-final/SCIENCE_OBJECT_NAME_BLUE+RED_spectrum.png
-final/SCIENCE_OBJECT_NAME_joined.png
-final/SCIENCE_OBJECT_NAME_join_scale.txt
+objects/OBJECT/
+  BLUE/ and RED/     input cubes, *_crclean.fits, and *_crmask.fits
+  apertures/         accepted aperture JSON files
+  extracted/         individual extracted spectra
+  coadded_spectra/   approved side coadds and exposure counts
+  fluxcal/           side-level calibrated spectra and telluric diagnostics
+  final/             final spectra, plots, and join scale
+  diagnostics/       aperture, CR, coadd, and calibration plots
+  extraction_state.json
 ```
 
-## 8. Output File Conventions
-
-Spectrum products are ASCII files with `.flm` extension.
-
-Flux-calibrated spectra are saved in units of:
-
-```text
-1e-15 erg/s/cm^2/A
-```
-
-KCWI DRP `*_icubes.fits` fluxes are commonly in `1e-16 erg/s/cm^2/A`, but this pipeline rescales calibrated saved spectra by a factor of 10 so the `.flm` flux and `sigma_flux` columns are in `1e-15 erg/s/cm^2/A`. For example, a saved flux value of `2.4` means:
-
-```text
-2.4 x 10^-15 erg/s/cm^2/A
-```
-
-Examples:
-
-```text
-extracted/BLUE/*_counts.flm
-extracted/RED/*_counts.flm
-coadded_spectra/OBJECT_BLUE_counts_coadd.flm
-coadded_spectra/OBJECT_RED_counts_coadd.flm
-fluxcal/OBJECT_BLUE_fluxcal.flm
-fluxcal/OBJECT_RED_fluxcal.flm
-final/OBJECT_BLUE+RED_spectrum.flm
-final/OBJECT_BLUE_spectrum.flm
-final/OBJECT_RED_spectrum.flm
-```
-
-If uncertainty exists, spectra have three columns:
+Spectrum tables use the `.flm` extension. When uncertainty is available, they
+have three columns:
 
 ```text
 lambda_A  flux_or_counts  sigma_flux_or_counts
 ```
 
-For flux-calibrated products, `flux` and `sigma_flux` are in `1e-15 erg/s/cm^2/A`. For counts products, the values remain in the native extracted cube/count scale.
-
-If uncertainty is unavailable, spectra have two columns:
+Otherwise they contain wavelength and flux/counts only. Final and `fluxcal/`
+spectra use:
 
 ```text
-lambda_A  flux_or_counts
+1e-15 erg/s/cm^2/A
 ```
 
-Non-spectrum metadata and calibration tables remain `.txt`, for example:
+For example, a saved flux value of `2.4` means
+`2.4e-15 erg/s/cm^2/A`. Flux and `sigma_flux` use the same units.
+
+Frequently used files include:
 
 ```text
+extracted/SIDE/*_counts.flm
+coadded_spectra/OBJECT_SIDE_counts_coadd.flm
 coadded_spectra/OBJECT_SIDE_nexp.txt
-calibrations/STANDARD/SIDE/sensitivity_SIDE.txt
-calibrations/STANDARD/SIDE/observed_continuum_SIDE.txt
-calibrations/STANDARD/SIDE/ab_reference_flux_SIDE.txt
-calibrations/STANDARD/RED/telluric_O2_template_RED.txt
-fluxcal/OBJECT_RED_telluric_correction_arrays.txt
-final/OBJECT_join_scale.txt
+fluxcal/OBJECT_SIDE_fluxcal.flm
+final/OBJECT_BLUE+RED_spectrum.flm
+final/OBJECT_SIDE_spectrum.flm
 ```
 
-## 9. Coaddition Logic
-
-1. Extract each individual `*_icubes.fits` exposure.
-2. Interpolate spectra onto the first exposure wavelength grid if needed.
-3. Sigma-clip the stack at each wavelength.
-4. If uncertainty exists for all exposures, inverse-variance weight the surviving samples.
-5. If uncertainty is unavailable, mean-combine the surviving samples.
-6. Save the number of accepted spectra per wavelength in `*_nexp.txt`.
-
-The current 1D coadd clipping is symmetric:
+The standard-star equivalents are:
 
 ```text
-sigma = 3.0
+final/STD_OBJECT_BLUE_standard_processed.flm
+final/STD_OBJECT_RED_standard_processed.flm
+```
+
+## Data requirements and caveats
+
+- Do not mix `*_icubes.fits` and `*_icubed.fits` in one project or requested
+  two-side extraction.
+- Build standards from the same cube type as the science data.
+- Aperture propagation between cubes depends on valid celestial WCS metadata.
+  If transformation fails or falls outside the field, define the aperture
+  normally.
+- RED telluric correction requires valid standard and science airmasses.
+- The final uncertainty shading appears only when an uncertainty column exists.
+- Use the generated diagnostics and `extraction_state.json` to audit processing
+  choices.
+
+## Technical details
+
+The sections below document the calculations and defaults. They are not needed
+for a routine run, but explain the behavior referenced above.
+
+### Cube products and exposure time
+
+The two supported suffixes describe different KCWI processing stages:
+
+- `*_icubed.fits`: the extracted spectrum and uncertainty are divided by that
+  exposure's positive exposure time before coaddition and calibration. The
+  pipeline checks `XPOSURE`, `ELAPTIME`, `EXPTIME`, `TELAPSE`, then `TTIME`.
+- `*_icubes.fits`: values are already exposure-normalized by the DRP and are not
+  divided by exposure time again.
+
+The standard calibration registry records cube type, input units, exposure
+normalization, and schema version. A calibration is offered only when compatible
+with the science cube type.
+
+### Cosmic-ray treatment
+
+Cube-level CR rejection analyzes detector slices as wavelength-versus-position
+images. It links narrow spatial spikes into tracks, checks them against a
+same-spaxel spectral model, rejects tracks that resemble astronomical structure,
+and interpolates accepted voxels along wavelength. Current default seed,
+track-support, and mask-growth thresholds are 5.5, 3.25, and 1.75 sigma. Tracks
+spanning more than 64 wavelength pixels are rejected by default.
+
+Derived products are saved beside each input cube:
+
+```text
+*_crclean.fits
+*_crmask.fits
+```
+
+When an input `UNCERT` extension exists, replaced voxels receive updated
+uncertainties that include propagated interpolation uncertainty and local model
+scatter. Cached products from an incompatible detector version are rebuilt.
+
+The later 1D CR review uses the grating and slicer metadata to estimate resolving
+power. By default, a candidate must have absolute continuum-subtracted
+significance of at least 5 sigma and measured FWHM below 0.65 times the expected
+instrumental FWHM. Both positive and negative residuals are checked because a CR
+in the background aperture can create a negative feature after subtraction.
+
+Removing a candidate replaces only its highlighted pixels. Endpoint variance
+and local interpolation scatter are propagated into the replacement
+uncertainty. Review decisions and the original coadd are retained under
+`coadded_spectra/` and `diagnostics/SIDE/`.
+
+### Extraction, coaddition, and uncertainty
+
+The pipeline extracts every exposure separately. At each wavelength, target
+spaxels are summed and a sigma-clipped weighted background is subtracted. If
+flags or nonfinite values remove target spaxels, the surviving fractional target
+area is used for both background subtraction and its variance.
+
+The background uncertainty is the larger of:
+
+- uncertainty propagated from the input variance; and
+- the standard error inferred from retained background-spaxel scatter.
+
+Before coaddition, spectra are placed on the first exposure's wavelength grid
+when necessary. Flux is linearly interpolated; variance is propagated with the
+squares of the interpolation weights rather than interpolating sigma directly.
+
+The default coadd uses symmetric clipping with:
+
+```text
+sigma = 2.0
 maxiters = 5
 ```
 
-The background aperture is also sigma-clipped at each wavelength before estimating the weighted mean background:
+The user can change `sigma` in the coadd review window. Surviving samples are
+inverse-variance weighted when every exposure has valid uncertainty; otherwise
+they are mean-combined. Formal coadd uncertainty is inflated by the square root
+of reduced chi-square where accepted exposures disagree more than their reported
+uncertainties predict. This check can increase, but never decrease, the formal
+uncertainty.
+
+The number of accepted exposures at each wavelength is saved in
+`coadded_spectra/OBJECT_SIDE_nexp.txt`.
+
+### Flux and telluric calibration
+
+For a standard star, the built-in AB mag reference spectrum is interpolated onto the
+observed wavelength grid. The sensitivity is:
 
 ```text
-sigma = 2.5
-maxiters = 5
+sensitivity = reference_flux / fitted_observed_continuum
 ```
 
-Science coadd diagnostics are saved and displayed:
+Applying sensitivity, telluric transmission, or an accepted BLUE/RED scale is a
+multiplicative operation; the spectrum uncertainty is multiplied by the
+absolute value of the same factor.
+
+For RED standards, the telluric template is the observed standard divided by
+its fitted continuum within configured atmospheric windows. For RED science,
+the template is shifted using the O2 B and A bands and scaled for the standard
+and science airmasses:
 
 ```text
-diagnostics/SIDE/OBJECT_SIDE_coadd_diagnostic.png
-```
-
-The plot shows:
-
-- every extracted exposure with a vertical offset;
-- the sigma-clipped coadd;
-- coadd uncertainty if available;
-- `N used` versus wavelength.
-
-## 10. Flux Calibration and Telluric Correction
-
-Standard-star flux calibration uses AB magnitudes from:
-
-```text
-kcwi_pipeline/abcalc.py
-```
-
-The AB reference flux is interpolated onto the extracted standard wavelength grid. The sensitivity function is:
-
-```text
-sensitivity = reference_flux / observed_standard_continuum
-```
-
-The AB reference flux and sensitivity function are scaled so calibrated outputs are in `1e-15 erg/s/cm^2/A`.
-
-
-RED telluric correction uses a normalized atmospheric transmission template
-from the RED standard. During the RED standard continuum fit, the telluric
-windows are excluded from the spline so the absorption troughs remain in the
-standard spectrum. The template is then:
-
-```text
-T_std = observed_standard_counts / fitted_standard_continuum
-```
-
-Outside the telluric windows, the template is set to unity. Inside the
-telluric windows, values are clipped to the configured minimum transmission
-before correction.
-
-For science RED spectra, the pipeline first estimates a wavelength shift for
-the telluric template using the O2 B and A bands, then opens an interactive
-alignment plot so the shift can be reviewed or adjusted. Positive shifts move
-the template redward. The shifted template is then scaled by the standard and
-science airmasses:
-
-```text
-T_shifted = shifted(T_std, shift_A)
-T_scaled = T_shifted ** ((X_sci / X_std) ** 0.55)
+T_scaled = T_shifted ** ((X_science / X_standard) ** 0.55)
 flux_corrected = flux_uncorrected / T_scaled
 ```
 
-The correction is applied only in these RED telluric windows:
+Correction windows are:
 
 ```text
-5890-5896 A
-6270-6330 A
-6860-6935 A
-7160-7340 A
-7590-7700 A
-8120-8350 A
+5890--5896 A
+6270--6330 A
+6860--6935 A
+7160--7340 A
+7590--7700 A
+8120--8350 A
 ```
 
-The automatic wavelength-shift estimate uses only:
+Only `6860--6935 A` and `7590--7700 A` are used for the automatic shift
+estimate.
+
+### Wavelength ranges
+
+Extraction, calibration, plotting, and final products are trimmed to:
 
 ```text
-6860-6935 A
-7590-7700 A
+BLUE: 3550--5550 A
+RED:  5650--8800 A
 ```
 
-Science RED telluric diagnostics:
-
-```text
-calibrations/STANDARD/RED/telluric_standard_template_RED.txt
-calibrations/STANDARD/RED/telluric_template_RED.png
-fluxcal/OBJECT_RED_fluxcal_before_telluric.flm
-fluxcal/OBJECT_RED_telluric_correction.png
-fluxcal/OBJECT_RED_telluric_detail.png
-fluxcal/OBJECT_RED_telluric_correction_arrays.txt
-```
-
-## 11. Default Wavelength Ranges
-
-The pipeline trims all major extraction, calibration, plotting, and final products to:
-
-```text
-BLUE: 3550-5550 A
-RED:  5650-8800 A
-```
-
-These defaults are currently defined in:
-
-```text
-kcwi_pipeline/object_workflow.py
-```
-
-Look for:
-
-```python
-DEFAULT_SIDE_RANGES = {
-    "BLUE": (3550.0, 5550.0),
-    "RED": (5650.0, 8800.0),
-}
-```
-
-## 12. Practical Run Order for a New Dataset
-
-1. Organize the KOA directory:
-
-```bash
-python run_kcwi_reduction.py organize /path/to/koa_download --project /path/to/kcwi_project
-```
-
-2. Inspect the object directories:
-
-```bash
-ls /path/to/kcwi_project/objects
-```
-
-3. Extract the relevant standard stars first:
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/STD_RED --standard --side red
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/STD_BLUE --standard --side blue
-```
-
-4. Extract science objects:
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT --science --side both
-```
-
-5. If one side needs improvement, rerun only that side:
-
-```bash
-python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJECT --science --side red --redo-apertures
-```
-
-The pipeline will reuse the existing other side, rerun join approval, and refresh the final combined spectrum.
-
-## 13. Notes and Caveats
-
-- The workflow expects KOA/KCWI Level 2 `*_icubes.fits`, not `*_icubed.fits`.
-- The final science spectrum is based on per-exposure extraction followed by 1D spectral coaddition.
-- Aperture definitions are saved in JSON files under `apertures/SIDE/`.
-- Existing apertures are displayed for approval before reuse.
-- RED telluric correction requires valid standard and science airmass values. If either is missing, the pipeline prints a warning and skips the correction.
-- Final PNGs show uncertainty shading only when an uncertainty column exists.
-- Master calibration products are shared across science objects through `calibrations/calibration_registry.json`.
+These defaults are defined by `DEFAULT_SIDE_RANGES` in
+`kcwi_pipeline/object_workflow.py`.

@@ -20,6 +20,7 @@ class OrganizedFile:
     imtype: Optional[str]
     date_obs: Optional[str]
     airmass: Optional[float]
+    product_type: str
 
 
 def _clean_object_name(value: object) -> str:
@@ -61,13 +62,38 @@ def _link_copy_or_move(src: Path, dst: Path, mode: str) -> None:
         raise ValueError(f"Unknown file organization mode: {mode}")
 
 
+def discover_cube_products(input_dir: Path) -> List[Path]:
+    input_dir = input_dir.expanduser().resolve()
+    return sorted({
+        path
+        for pattern in ("*_icubes.fits", "*_icubed.fits")
+        for path in input_dir.rglob(pattern)
+    })
+
+
 def discover_icubes(input_dir: Path) -> List[Path]:
+    """Backward-compatible discovery of Level 2 ``*_icubes.fits`` files."""
     input_dir = input_dir.expanduser().resolve()
     return sorted(input_dir.rglob("*_icubes.fits"))
 
 
-def organize_project(input_dir: Path, project_dir: Path, *, mode: str = "symlink") -> Dict[str, object]:
-    """Organize KOA KCWI Level 2 *_icubes.fits files into object/side folders."""
+def cube_product_type(path: Path) -> str:
+    """Return the pipeline product class encoded by a KCWI cube filename."""
+    name = path.name.lower()
+    if name.endswith("_icubed.fits"):
+        return "icubed"
+    if name.endswith("_icubes.fits"):
+        return "icubes"
+    return "unknown"
+
+
+def organize_project(
+    input_dir: Path,
+    project_dir: Path,
+    *,
+    mode: str = "symlink",
+) -> Dict[str, object]:
+    """Organize one consistent KCWI cube product type into object/side folders."""
     input_dir = input_dir.expanduser().resolve()
     project_dir = project_dir.expanduser().resolve()
     objects_dir = project_dir / "objects"
@@ -75,14 +101,47 @@ def organize_project(input_dir: Path, project_dir: Path, *, mode: str = "symlink
     objects_dir.mkdir(parents=True, exist_ok=True)
     calibrations_dir.mkdir(parents=True, exist_ok=True)
 
-    files = discover_icubes(input_dir)
+    files = discover_cube_products(input_dir)
     if not files:
-        raise FileNotFoundError(f"No *_icubes.fits files found under {input_dir}")
+        raise FileNotFoundError(f"No *_icubes.fits or *_icubed.fits files found under {input_dir}")
+
+    product_types = {cube_product_type(path) for path in files}
+    if len(product_types) != 1:
+        print(
+            "WARNING: Mixed KCWI cube products detected. All standards and science "
+            "targets in one project must use the same *_icubed.fits or *_icubes.fits type."
+        )
+        details = ", ".join(
+            f"{product_type}: {sum(cube_product_type(path) == product_type for path in files)}"
+            for product_type in sorted(product_types)
+        )
+        raise ValueError(f"Cannot organize mixed cube products ({details})")
+    project_product_type = next(iter(product_types))
 
     organized: List[OrganizedFile] = []
     for src in files:
         with fits.open(src, memmap=True) as hdul:
-            hdr = hdul[0].header
+            cube_hdu = next(
+                (
+                    hdu for hdu in hdul
+                    if getattr(hdu, "data", None) is not None
+                    and getattr(hdu.data, "ndim", 0) == 3
+                ),
+                hdul[0],
+            )
+            hdr = cube_hdu.header.copy()
+            for key in (
+                "OBJECT", "TARGNAME", "CAMERA", "AIRMASS", "IMTYPE",
+                "DATE-OBS", "DATE-BEG", "DATE-END", "EXPTIME", "ELAPTIME",
+                "XPOSURE", "TELAPSE", "TTIME",
+            ):
+                if key in hdul[0].header and key not in hdr:
+                    hdr[key] = hdul[0].header[key]
+            for key, value in hdul[0].header.items():
+                if key not in hdr and (
+                    key.startswith(("WCSAXES", "CTYPE", "CRVAL", "CRPIX", "CDELT", "CD", "PC"))
+                ):
+                    hdr[key] = value
             obj = _clean_object_name(hdr.get("OBJECT", hdr.get("TARGNAME")))
             side = _clean_side(hdr.get("CAMERA"), src.name)
             imtype = hdr.get("IMTYPE")
@@ -106,6 +165,7 @@ def organize_project(input_dir: Path, project_dir: Path, *, mode: str = "symlink
                 imtype=imtype,
                 date_obs=date_obs,
                 airmass=airmass,
+                product_type=cube_product_type(src),
             )
         )
 
@@ -113,6 +173,7 @@ def organize_project(input_dir: Path, project_dir: Path, *, mode: str = "symlink
         "input_dir": str(input_dir),
         "project_dir": str(project_dir),
         "mode": mode,
+        "product_type": project_product_type,
         "files": [asdict(item) for item in organized],
         "objects": {},
     }

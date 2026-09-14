@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.interpolate import UnivariateSpline
 
+from .uncertainty import linear_resample_with_uncertainty
 from .utils import safe_filename, savefig_show
 
 FLUX_UNIT_LABEL = "1e-15 erg/s/cm^2/A"
@@ -96,9 +97,28 @@ def apply_sensitivity(
     C_obj: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Apply sensitivity curve (defined on lam_ref grid) to an object counts spectrum."""
-    C_int = np.interp(lam_ref, lam_obj, C_obj)
+    C_int, _ = linear_resample_with_uncertainty(lam_ref, lam_obj, C_obj)
     F_obj = S_sens * C_int
     return lam_ref, F_obj
+
+
+def apply_sensitivity_with_uncertainty(
+    lam_ref: np.ndarray,
+    S_sens: np.ndarray,
+    lam_obj: np.ndarray,
+    C_obj: np.ndarray,
+    sigma_obj: Optional[np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Apply sensitivity and propagate resampling uncertainty onto its grid."""
+    C_int, sigma_int = linear_resample_with_uncertainty(
+        lam_ref,
+        lam_obj,
+        C_obj,
+        sigma_obj,
+    )
+    F_obj = S_sens * C_int
+    sigma_flux = np.abs(S_sens) * sigma_int if sigma_int is not None else None
+    return np.asarray(lam_ref), F_obj, sigma_flux
 
 
 def build_o2_transmission_template(

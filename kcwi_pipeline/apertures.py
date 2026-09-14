@@ -6,7 +6,7 @@ from typing import Tuple, Optional, Dict
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse, Rectangle, Circle
-from matplotlib.widgets import Slider, Button
+from matplotlib.widgets import Button, RadioButtons, RangeSlider, Slider, TextBox
 from photutils.aperture import (
     CircularAnnulus,
     CircularAperture,
@@ -17,6 +17,98 @@ from photutils.aperture import (
 
 from .config import ApertureShape, TargetBackgroundApertures
 from .utils import prompt
+
+
+class WhiteLightRangeController:
+    """Fast wavelength-range sums for interactive white-light displays."""
+
+    def __init__(
+        self,
+        cube: np.ndarray,
+        wavelength: np.ndarray,
+        *,
+        minimum: Optional[float] = None,
+        maximum: Optional[float] = None,
+    ) -> None:
+        cube = np.asarray(cube)
+        wavelength = np.asarray(wavelength, dtype=float)
+        if cube.ndim != 3 or wavelength.ndim != 1 or cube.shape[0] != wavelength.size:
+            raise ValueError(
+                "White-light wavelength controller requires cube (wavelength, y, x) "
+                "and a matching 1D wavelength array"
+            )
+        finite_wavelength = np.isfinite(wavelength)
+        if not np.any(finite_wavelength):
+            raise ValueError("White-light wavelength array has no finite values")
+
+        available_min = float(np.min(wavelength[finite_wavelength]))
+        available_max = float(np.max(wavelength[finite_wavelength]))
+        requested_min = available_min if minimum is None else float(minimum)
+        requested_max = available_max if maximum is None else float(maximum)
+        allowed = finite_wavelength & (wavelength >= requested_min) & (wavelength <= requested_max)
+        if not np.any(allowed):
+            allowed = finite_wavelength
+        self.slider_values = np.unique(np.sort(wavelength[allowed]))
+        self.available_min = float(self.slider_values[0])
+        self.available_max = float(self.slider_values[-1])
+        self.initial_min = self.available_min
+        self.initial_max = self.available_max
+        self.minimum = self.initial_min
+        self.maximum = self.initial_max
+        self._cube = cube
+        differences = np.diff(wavelength[finite_wavelength])
+        self._monotonic = bool(
+            np.all(differences >= 0) or np.all(differences <= 0)
+        )
+        self._wavelength = wavelength
+        self._prefix = np.empty(
+            (cube.shape[0] + 1, cube.shape[1], cube.shape[2]),
+            dtype=np.float32,
+        )
+        self._prefix[0] = 0.0
+        self._prefix[1:] = cube
+        np.nan_to_num(
+            self._prefix[1:],
+            copy=False,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        np.cumsum(self._prefix[1:], axis=0, out=self._prefix[1:])
+
+    @property
+    def bounds(self) -> Tuple[float, float]:
+        return self.minimum, self.maximum
+
+    @property
+    def initial_bounds(self) -> Tuple[float, float]:
+        return self.initial_min, self.initial_max
+
+    def set_bounds(self, minimum: float, maximum: float) -> None:
+        minimum = float(np.clip(minimum, self.available_min, self.available_max))
+        maximum = float(np.clip(maximum, self.available_min, self.available_max))
+        if maximum < minimum:
+            minimum, maximum = maximum, minimum
+        self.minimum = minimum
+        self.maximum = maximum
+
+    def image(self) -> np.ndarray:
+        selected = np.flatnonzero(
+            np.isfinite(self._wavelength)
+            & (self._wavelength >= self.minimum)
+            & (self._wavelength <= self.maximum)
+        )
+        if selected.size == 0:
+            nearest = int(
+                np.nanargmin(
+                    np.abs(self._wavelength - 0.5 * (self.minimum + self.maximum))
+                )
+            )
+            selected = np.array([nearest], dtype=int)
+        if self._monotonic:
+            return self._prefix[selected[-1] + 1] - self._prefix[selected[0]]
+        finite_cube = np.where(np.isfinite(self._cube[selected]), self._cube[selected], 0.0)
+        return np.sum(finite_cube, axis=0, dtype=np.float32)
 
 
 def _rotated_coords(ny: int, nx: int, x0: float, y0: float, theta: float):
@@ -157,6 +249,8 @@ def _white_light_two_panel(
     *,
     apertures: Optional[TargetBackgroundApertures] = None,
     shapes: Optional[Tuple[ApertureShape, ...]] = None,
+    wavelength_controller: Optional[WhiteLightRangeController] = None,
+    right_margin: float = 0.90,
 ):
     """Create a two-panel white-light view.
 
@@ -164,24 +258,47 @@ def _white_light_two_panel(
     Right panel uses the same data coordinates but compresses the y display scale
     by a factor of 3 to make elongated sources easier to compare to sky charts.
     """
+    if wavelength_controller is not None:
+        img = wavelength_controller.image()
     v1, v2 = _white_light_limits(img)
+    if right_margin <= 0.72:
+        figure_width = 14.5
+    elif right_margin < 0.85:
+        figure_width = 13.5
+    else:
+        figure_width = 12.0
     fig, (ax_left, ax_right) = plt.subplots(
         1,
         2,
-        figsize=(12, 5.8),
+        figsize=(figure_width, 6.6 if wavelength_controller is not None else 5.8),
         gridspec_kw={"width_ratios": [1.2, 1.0]},
     )
-    fig.subplots_adjust(left=0.07, right=0.90, bottom=0.18, top=0.88, wspace=0.25)
+    fig.subplots_adjust(
+        left=0.07,
+        right=right_margin,
+        bottom=0.31 if wavelength_controller is not None else 0.18,
+        top=0.88,
+        wspace=0.25,
+    )
 
     im = ax_left.imshow(img, origin="lower", vmin=v1, vmax=v2, cmap="viridis", aspect="equal")
-    ax_left.set_title("White light")
     ax_left.set_xlabel("x pixel")
     ax_left.set_ylabel("y pixel")
 
     im_right = ax_right.imshow(img, origin="lower", vmin=v1, vmax=v2, cmap="viridis", aspect=(1.0 / 3.0))
-    ax_right.set_title("White light, y compressed x3")
     ax_right.set_xlabel("x pixel")
     ax_right.set_ylabel("y pixel")
+
+    def update_panel_titles() -> None:
+        if wavelength_controller is None:
+            range_suffix = ""
+        else:
+            wave_min, wave_max = wavelength_controller.bounds
+            range_suffix = f" ({wave_min:.1f}-{wave_max:.1f} A)"
+        ax_left.set_title(f"White light{range_suffix}")
+        ax_right.set_title(f"White light, y compressed x3{range_suffix}")
+
+    update_panel_titles()
 
     if apertures is not None:
         _add_shape_patch(ax_left, apertures.target, edgecolor="red", lw=2.0)
@@ -199,19 +316,39 @@ def _white_light_two_panel(
     else:
         finite = np.asarray([0.0, 1.0])
         p_min, p_max = 0.0, 100.0
+    display_state = {"finite": finite}
 
-    ax_low = fig.add_axes([0.12, 0.075, 0.58, 0.025])
-    ax_high = fig.add_axes([0.12, 0.035, 0.58, 0.025])
-    ax_reset = fig.add_axes([0.73, 0.04, 0.10, 0.055])
+    contrast_y_offset = 0.0 if wavelength_controller is None else 0.01
+    slider_left = 0.10
+    reset_width = 0.09
+    reset_x = right_margin - reset_width - 0.02
+    slider_width = reset_x - slider_left - 0.03
+    ax_low = fig.add_axes([slider_left, 0.075 + contrast_y_offset, slider_width, 0.025])
+    ax_high = fig.add_axes([slider_left, 0.035 + contrast_y_offset, slider_width, 0.025])
+    ax_reset = fig.add_axes([reset_x, 0.04 + contrast_y_offset, reset_width, 0.055])
     low_slider = Slider(ax_low, "Low %", p_min, p_max, valinit=5.0, valstep=0.1)
     high_slider = Slider(ax_high, "High %", p_min, p_max, valinit=99.0, valstep=0.1)
     reset_button = Button(ax_reset, "Reset")
+    wavelength_slider = None
+    if wavelength_controller is not None:
+        ax_wavelength = fig.add_axes(
+            [slider_left, 0.145, right_margin - slider_left - 0.05, 0.032]
+        )
+        wavelength_slider = RangeSlider(
+            ax_wavelength,
+            "Wavelength (A)",
+            wavelength_controller.available_min,
+            wavelength_controller.available_max,
+            valinit=wavelength_controller.bounds,
+            valstep=wavelength_controller.slider_values,
+        )
 
     def update_scale(_val=None) -> None:
         lo = float(low_slider.val)
         hi = float(high_slider.val)
         if hi <= lo:
             return
+        finite = display_state["finite"]
         new_v1, new_v2 = np.nanpercentile(finite, [lo, hi])
         if not np.isfinite(new_v1) or not np.isfinite(new_v2) or new_v2 <= new_v1:
             return
@@ -222,11 +359,30 @@ def _white_light_two_panel(
     def reset_scale(_event=None) -> None:
         low_slider.set_val(5.0)
         high_slider.set_val(99.0)
+        if wavelength_slider is not None and wavelength_controller is not None:
+            wavelength_slider.set_val(wavelength_controller.initial_bounds)
+
+    def update_wavelength(bounds) -> None:
+        if wavelength_controller is None:
+            return
+        wavelength_controller.set_bounds(float(bounds[0]), float(bounds[1]))
+        updated = wavelength_controller.image()
+        im.set_data(updated)
+        im_right.set_data(updated)
+        updated_finite = updated[np.isfinite(updated)]
+        display_state["finite"] = (
+            updated_finite if updated_finite.size else np.asarray([0.0, 1.0])
+        )
+        update_panel_titles()
+        update_scale()
 
     low_slider.on_changed(update_scale)
     high_slider.on_changed(update_scale)
     reset_button.on_clicked(reset_scale)
+    if wavelength_slider is not None:
+        wavelength_slider.on_changed(update_wavelength)
     fig._kcwi_scale_widgets = (low_slider, high_slider, reset_button)
+    fig._kcwi_wavelength_widgets = (wavelength_slider,)
 
     fig.suptitle(title)
     fig.colorbar(im, ax=[ax_left, ax_right], label="White-light", fraction=0.035, pad=0.03)
@@ -237,8 +393,14 @@ def plot_apertures(img: np.ndarray,
                    apertures: TargetBackgroundApertures,
                    outpng: Path,
                    title: str,
-                   show: bool = False) -> None:
-    fig, _, _ = _white_light_two_panel(img, title, apertures=apertures)
+                   show: bool = False,
+                   wavelength_controller: Optional[WhiteLightRangeController] = None) -> None:
+    fig, _, _ = _white_light_two_panel(
+        img,
+        title,
+        apertures=apertures,
+        wavelength_controller=wavelength_controller,
+    )
     outpng.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(outpng, dpi=180, bbox_inches="tight")
     if show:
@@ -346,11 +508,17 @@ def prompt_aperture_current(shape: ApertureShape) -> ApertureShape:
     raise ValueError(f"Unknown shape kind: {sh}")
 
 
-def _click_center(img: np.ndarray, title: str) -> Tuple[float, float]:
+def _click_center(
+    img: np.ndarray,
+    title: str,
+    *,
+    wavelength_controller: Optional[WhiteLightRangeController] = None,
+) -> Tuple[float, float]:
     """Pop up a figure and return a single clicked (x, y) center."""
     fig, _, _ = _white_light_two_panel(
         img,
         title + "\nClick once in either panel to set center; close window if needed",
+        wavelength_controller=wavelength_controller,
     )
     # Block until one click is received.
     pts = plt.ginput(1, timeout=-1)
@@ -411,12 +579,14 @@ def _draw_shape_by_drag(
     title: str,
     *,
     reference_shapes: Tuple[ApertureShape, ...] = (),
+    wavelength_controller: Optional[WhiteLightRangeController] = None,
 ) -> ApertureShape:
     """Create and adjust an aperture shape on either white-light panel."""
     print(f"{title}: click-drag-release to draw, then move/resize. Press a/Enter when done.")
     fig, ax_left, ax_right = _white_light_two_panel(
         img,
         title + "\nClick-drag to draw. m=move, e=resize, drag to adjust. a/Enter=accept, r=redraw, q=cancel.",
+        wavelength_controller=wavelength_controller,
     )
     state = {
         "start": None,
@@ -542,12 +712,14 @@ def _drag_move_shape(
     title: str,
     *,
     reference_shapes: Tuple[ApertureShape, ...] = (),
+    wavelength_controller: Optional[WhiteLightRangeController] = None,
 ) -> ApertureShape:
     """Move an existing aperture by dragging on either panel until accepted."""
     print(f"{title}: click-drag the aperture on either panel to move/resize. Press a/Enter when done.")
     fig, ax_left, ax_right = _white_light_two_panel(
         img,
         title + "\nm=move, e=resize, drag to adjust. a/Enter=accept, q=cancel.",
+        wavelength_controller=wavelength_controller,
     )
 
     for ax in (ax_left, ax_right):
@@ -719,11 +891,510 @@ def _resize_shape_to_point(shape: ApertureShape, x: float, y: float) -> Aperture
     raise ValueError(f"Unknown shape: {sh}")
 
 
+def _shape_after_drag(
+    shape: ApertureShape,
+    mode: str,
+    start_xy: Tuple[float, float],
+    end_xy: Tuple[float, float],
+) -> ApertureShape:
+    """Return a moved or resized shape for one pointer drag."""
+    if mode == "resize":
+        return _resize_shape_to_point(shape, end_xy[0], end_xy[1])
+    if mode != "move":
+        raise ValueError(f"Unknown aperture edit mode: {mode}")
+    x0, y0 = _shape_center(shape)
+    return _update_shape_center(
+        shape,
+        x0 + float(end_xy[0]) - float(start_xy[0]),
+        y0 + float(end_xy[1]) - float(start_xy[1]),
+    )
+
+
+def _shape_parameter_labels(shape: ApertureShape) -> Tuple[str, ...]:
+    labels = {
+        "circle": ("x0", "y0", "radius"),
+        "ellipse": ("x0", "y0", "semi-major", "semi-minor", "theta rad"),
+        "rect": ("x0", "y0", "width", "height", "theta rad"),
+        "circle_annulus": ("x0", "y0", "inner radius", "outer radius"),
+        "ellipse_annulus": (
+            "x0",
+            "y0",
+            "inner a",
+            "inner b",
+            "outer a",
+            "outer b",
+            "theta rad",
+        ),
+    }
+    try:
+        return labels[shape.shape]
+    except KeyError as exc:
+        raise ValueError(f"Unknown shape: {shape.shape}") from exc
+
+
+def _shape_from_parameter_values(
+    shape: ApertureShape,
+    values: Tuple[float, ...],
+) -> ApertureShape:
+    expected = len(_shape_parameter_labels(shape))
+    if len(values) != expected:
+        raise ValueError(f"{shape.shape} requires {expected} values")
+    values = tuple(float(value) for value in values)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("All aperture values must be finite")
+
+    if shape.shape == "circle" and values[2] <= 0:
+        raise ValueError("Radius must be positive")
+    if shape.shape in {"ellipse", "rect"} and (values[2] <= 0 or values[3] <= 0):
+        raise ValueError("Aperture dimensions must be positive")
+    if shape.shape == "circle_annulus":
+        if values[2] <= 0 or values[3] <= values[2]:
+            raise ValueError("Outer radius must be larger than positive inner radius")
+    if shape.shape == "ellipse_annulus":
+        if min(values[2:6]) <= 0 or values[4] <= values[2] or values[5] <= values[3]:
+            raise ValueError("Outer annulus axes must exceed positive inner axes")
+    return ApertureShape(shape.shape, values)
+
+
+def _shape_outer_half_extents(shape: ApertureShape) -> Tuple[float, float]:
+    p = shape.params
+    if shape.shape == "circle":
+        return float(p[2]), float(p[2])
+    if shape.shape == "ellipse":
+        return float(p[2]), float(p[3])
+    if shape.shape == "rect":
+        return float(p[2]) / 2.0, float(p[3]) / 2.0
+    if shape.shape == "circle_annulus":
+        return float(p[3]), float(p[3])
+    if shape.shape == "ellipse_annulus":
+        return float(p[4]), float(p[5])
+    raise ValueError(f"Unknown shape: {shape.shape}")
+
+
+def _convert_aperture_shape(
+    shape: ApertureShape,
+    new_kind: str,
+) -> ApertureShape:
+    """Convert shape geometry while preserving its center and approximate extent."""
+    new_kind = new_kind.lower().strip().replace(" ", "_")
+    x0, y0 = _shape_center(shape)
+    half_x, half_y = _shape_outer_half_extents(shape)
+    half_x = max(abs(half_x), 0.5)
+    half_y = max(abs(half_y), 0.5)
+    theta = 0.0
+    if shape.shape in {"ellipse", "rect"}:
+        theta = float(shape.params[4])
+    elif shape.shape == "ellipse_annulus":
+        theta = float(shape.params[6])
+
+    if new_kind == "circle":
+        return ApertureShape("circle", (x0, y0, 0.5 * (half_x + half_y)))
+    if new_kind == "ellipse":
+        return ApertureShape("ellipse", (x0, y0, half_x, half_y, theta))
+    if new_kind == "rect":
+        return ApertureShape("rect", (x0, y0, 2.0 * half_x, 2.0 * half_y, theta))
+    if new_kind == "square":
+        side = 2.0 * max(half_x, half_y)
+        return ApertureShape("rect", (x0, y0, side, side, theta))
+    if new_kind == "circle_annulus":
+        outer = max(half_x, half_y)
+        return ApertureShape("circle_annulus", (x0, y0, 0.6 * outer, outer))
+    if new_kind == "ellipse_annulus":
+        return ApertureShape(
+            "ellipse_annulus",
+            (x0, y0, 0.6 * half_x, 0.6 * half_y, half_x, half_y, theta),
+        )
+    raise ValueError(f"Unknown shape kind: {new_kind}")
+
+
+def _review_apertures_in_window(
+    img: np.ndarray,
+    apertures: TargetBackgroundApertures,
+    title: str,
+    *,
+    wavelength_controller: Optional[WhiteLightRangeController] = None,
+) -> Optional[TargetBackgroundApertures]:
+    """Review and edit both apertures in one self-contained blocking window."""
+    fig, ax_left, ax_right = _white_light_two_panel(
+        img,
+        title,
+        wavelength_controller=wavelength_controller,
+        right_margin=0.70,
+    )
+
+    state = {
+        "apertures": apertures,
+        "active": "target",
+        "mode": "move",
+        "drag_start": None,
+        "drag_shape": None,
+        "accepted": False,
+        "cancelled": False,
+        "patches": [],
+        "modal": None,
+        "modal_axes": [],
+        "modal_artists": [],
+        "modal_widgets": [],
+    }
+
+    button_specs = (
+        ("accept", "Accept", 0.845),
+        ("move_target", "Move target", 0.715),
+        ("resize_target", "Resize target", 0.655),
+        ("shape_target", "Target shape...", 0.595),
+        ("move_background", "Move background", 0.465),
+        ("resize_background", "Resize background", 0.405),
+        ("shape_background", "Background shape...", 0.345),
+        ("enter_values", "Enter values...", 0.245),
+        ("cancel", "Cancel", 0.185),
+    )
+    buttons = {}
+    for name, label, y0 in button_specs:
+        button_ax = fig.add_axes([0.805, y0, 0.18, 0.048])
+        buttons[name] = Button(button_ax, label)
+    group_artists = [
+        fig.text(0.805, 0.785, "TARGET", fontsize=10, fontweight="bold", color="darkred"),
+        fig.text(
+            0.805,
+            0.535,
+            "BACKGROUND",
+            fontsize=10,
+            fontweight="bold",
+            color="darkorange",
+        ),
+    ]
+
+    def active_shape() -> ApertureShape:
+        current = state["apertures"]
+        return current.target if state["active"] == "target" else current.background
+
+    def set_active_shape(shape: ApertureShape) -> None:
+        current = state["apertures"]
+        if state["active"] == "target":
+            state["apertures"] = TargetBackgroundApertures(
+                target=shape,
+                background=current.background,
+            )
+        else:
+            state["apertures"] = TargetBackgroundApertures(
+                target=current.target,
+                background=shape,
+            )
+
+    def clear_patches() -> None:
+        for patch in state["patches"]:
+            try:
+                patch.remove()
+            except Exception:
+                pass
+        state["patches"] = []
+
+    def add_preview(shape: ApertureShape, *, edgecolor: str, lw: float) -> None:
+        for ax in (ax_left, ax_right):
+            patch = _patch_for_shape(shape, edgecolor=edgecolor, lw=lw)
+            patches = patch if isinstance(patch, tuple) else (patch,)
+            for item in patches:
+                ax.add_patch(item)
+                state["patches"].append(item)
+
+    def set_main_controls_visible(visible: bool) -> None:
+        for button in buttons.values():
+            button.ax.set_visible(visible)
+        for artist in group_artists:
+            artist.set_visible(visible)
+
+    def clear_modal() -> None:
+        for axes in state["modal_axes"]:
+            try:
+                axes.remove()
+            except Exception:
+                pass
+        for artist in state["modal_artists"]:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        state["modal"] = None
+        state["modal_axes"] = []
+        state["modal_artists"] = []
+        state["modal_widgets"] = []
+        set_main_controls_visible(True)
+
+    def update_title_and_buttons() -> None:
+        active = str(state["active"])
+        mode = str(state["mode"])
+        fig.suptitle(
+            f"{title}\n{active.upper()} {mode.upper()}: drag in either panel. "
+            "Use the controls at right, then Accept."
+        )
+        active_button = f"{mode}_{active}"
+        for name, button in buttons.items():
+            if name == "accept":
+                color = "#b7e4c7"
+            elif name == "cancel":
+                color = "#f4cccc"
+            elif name == active_button:
+                color = "#9ecae1"
+            else:
+                color = "0.92"
+            button.ax.set_facecolor(color)
+
+    def draw_preview() -> None:
+        clear_patches()
+        current = state["apertures"]
+        target_lw = 2.8 if state["active"] == "target" else 1.8
+        background_lw = 2.8 if state["active"] == "background" else 1.6
+        add_preview(current.target, edgecolor="red", lw=target_lw)
+        add_preview(current.background, edgecolor="orange", lw=background_lw)
+        update_title_and_buttons()
+        fig.canvas.draw_idle()
+
+    def set_mode(active: str, mode: str) -> None:
+        if active not in {"target", "background"}:
+            raise ValueError(f"Unknown active aperture: {active}")
+        if mode not in {"move", "resize"}:
+            raise ValueError(f"Unknown aperture edit mode: {mode}")
+        state["active"] = active
+        state["mode"] = mode
+        state["drag_start"] = None
+        state["drag_shape"] = None
+        draw_preview()
+
+    def change_shape(active: str, new_kind: str) -> None:
+        state["active"] = active
+        current = active_shape()
+        normalized_kind = new_kind.lower().strip().replace(" ", "_")
+        if active == "background" and normalized_kind.startswith("auto_"):
+            annulus_kind = normalized_kind.removeprefix("auto_")
+            replacement = _auto_background_from_target(
+                state["apertures"].target,
+                annulus_kind,
+            )
+        else:
+            replacement = _convert_aperture_shape(current, normalized_kind)
+        set_active_shape(replacement)
+        state["mode"] = "resize"
+        draw_preview()
+
+    def set_values(active: str, values: Tuple[float, ...]) -> None:
+        state["active"] = active
+        set_active_shape(_shape_from_parameter_values(active_shape(), values))
+        draw_preview()
+
+    def apply_drag(start_xy: Tuple[float, float], end_xy: Tuple[float, float]) -> None:
+        set_active_shape(
+            _shape_after_drag(active_shape(), str(state["mode"]), start_xy, end_xy)
+        )
+        draw_preview()
+
+    def accept(_event=None) -> None:
+        if state["modal"] is not None:
+            return
+        state["accepted"] = True
+        plt.close(fig)
+
+    def cancel(_event=None) -> None:
+        state["cancelled"] = True
+        plt.close(fig)
+
+    def modal_artist(x: float, y: float, text: str, **kwargs):
+        artist = fig.text(x, y, text, **kwargs)
+        state["modal_artists"].append(artist)
+        return artist
+
+    def modal_axes(bounds):
+        axes = fig.add_axes(bounds)
+        state["modal_axes"].append(axes)
+        return axes
+
+    def open_shape_selector(active: str) -> None:
+        clear_modal()
+        set_main_controls_visible(False)
+        state["modal"] = "shape"
+        state["active"] = active
+        if active == "target":
+            choices = ("circle", "ellipse", "rect", "square")
+        else:
+            choices = (
+                "auto ellipse annulus",
+                "auto circle annulus",
+                "ellipse annulus",
+                "circle annulus",
+                "ellipse",
+                "circle",
+                "rect",
+            )
+        modal_artist(
+            0.805,
+            0.855,
+            f"Choose {active} shape",
+            fontsize=10,
+            fontweight="bold",
+        )
+        radio_ax = modal_axes([0.805, 0.36, 0.18, 0.46])
+        current_name = active_shape().shape.replace("_", " ")
+        active_index = choices.index(current_name) if current_name in choices else 0
+        radio = RadioButtons(radio_ax, choices, active=active_index)
+        apply_button = Button(modal_axes([0.805, 0.275, 0.085, 0.052]), "Apply")
+        back_button = Button(modal_axes([0.905, 0.275, 0.08, 0.052]), "Back")
+
+        def apply_selection(_event=None) -> None:
+            selected = str(radio.value_selected).replace(" ", "_")
+            change_shape(active, selected)
+            clear_modal()
+            draw_preview()
+
+        apply_button.on_clicked(apply_selection)
+        back_button.on_clicked(lambda _event: (clear_modal(), draw_preview()))
+        state["modal_widgets"] = [radio, apply_button, back_button]
+        fig.canvas.draw_idle()
+
+    def open_value_editor() -> None:
+        active = str(state["active"])
+        shape = active_shape()
+        labels = _shape_parameter_labels(shape)
+        clear_modal()
+        set_main_controls_visible(False)
+        state["modal"] = "values"
+        modal_artist(
+            0.805,
+            0.865,
+            f"{active.title()} values\n{shape.shape.replace('_', ' ')}",
+            fontsize=10,
+            fontweight="bold",
+        )
+        error_artist = modal_artist(0.805, 0.105, "", fontsize=8, color="darkred")
+        text_boxes = []
+        start_y = 0.785
+        spacing = 0.072
+        for index, (label, value) in enumerate(zip(labels, shape.params)):
+            text_box = TextBox(
+                modal_axes([0.895, start_y - index * spacing, 0.09, 0.043]),
+                label,
+                initial=f"{float(value):.7g}",
+            )
+            text_boxes.append(text_box)
+        apply_button = Button(modal_axes([0.805, 0.16, 0.085, 0.052]), "Apply")
+        back_button = Button(modal_axes([0.905, 0.16, 0.08, 0.052]), "Back")
+
+        def apply_values(_event=None) -> None:
+            try:
+                values = tuple(float(box.text) for box in text_boxes)
+                set_values(active, values)
+            except (TypeError, ValueError) as exc:
+                error_artist.set_text(str(exc))
+                fig.canvas.draw_idle()
+                return
+            clear_modal()
+            draw_preview()
+
+        apply_button.on_clicked(apply_values)
+        back_button.on_clicked(lambda _event: (clear_modal(), draw_preview()))
+        state["modal_widgets"] = [*text_boxes, apply_button, back_button]
+        fig.canvas.draw_idle()
+
+    def on_press(event) -> None:
+        if event.inaxes not in (ax_left, ax_right) or event.xdata is None or event.ydata is None:
+            return
+        state["drag_start"] = (float(event.xdata), float(event.ydata))
+        state["drag_shape"] = active_shape()
+
+    def update_from_event(event) -> None:
+        if (
+            state["drag_start"] is None
+            or state["drag_shape"] is None
+            or event.inaxes not in (ax_left, ax_right)
+            or event.xdata is None
+            or event.ydata is None
+        ):
+            return
+        edited = _shape_after_drag(
+            state["drag_shape"],
+            str(state["mode"]),
+            state["drag_start"],
+            (float(event.xdata), float(event.ydata)),
+        )
+        set_active_shape(edited)
+        draw_preview()
+
+    def on_motion(event) -> None:
+        update_from_event(event)
+
+    def on_release(event) -> None:
+        update_from_event(event)
+        state["drag_start"] = None
+        state["drag_shape"] = None
+
+    def on_key(event) -> None:
+        key = str(event.key or "").lower()
+        if state["modal"] is not None:
+            if key == "escape":
+                clear_modal()
+                draw_preview()
+            return
+        if key in {"a", "enter", "return"}:
+            accept()
+        elif key == "t":
+            set_mode("target", "move")
+        elif key == "b":
+            set_mode("background", "move")
+        elif key == "m":
+            set_mode(str(state["active"]), "move")
+        elif key == "e":
+            set_mode(str(state["active"]), "resize")
+        elif key == "q":
+            cancel()
+
+    buttons["accept"].on_clicked(accept)
+    buttons["move_target"].on_clicked(lambda _event: set_mode("target", "move"))
+    buttons["resize_target"].on_clicked(lambda _event: set_mode("target", "resize"))
+    buttons["shape_target"].on_clicked(lambda _event: open_shape_selector("target"))
+    buttons["move_background"].on_clicked(lambda _event: set_mode("background", "move"))
+    buttons["resize_background"].on_clicked(
+        lambda _event: set_mode("background", "resize")
+    )
+    buttons["shape_background"].on_clicked(
+        lambda _event: open_shape_selector("background")
+    )
+    buttons["enter_values"].on_clicked(lambda _event: open_value_editor())
+    buttons["cancel"].on_clicked(cancel)
+    cids = [
+        fig.canvas.mpl_connect("button_press_event", on_press),
+        fig.canvas.mpl_connect("motion_notify_event", on_motion),
+        fig.canvas.mpl_connect("button_release_event", on_release),
+        fig.canvas.mpl_connect("key_press_event", on_key),
+    ]
+    fig._kcwi_aperture_review_widgets = buttons
+    fig._kcwi_aperture_review_state = state
+    fig._kcwi_aperture_review_actions = {
+        "set_mode": set_mode,
+        "apply_drag": apply_drag,
+        "change_shape": change_shape,
+        "set_values": set_values,
+        "accept": accept,
+        "cancel": cancel,
+    }
+    draw_preview()
+    plt.show()
+    for cid in cids:
+        fig.canvas.mpl_disconnect(cid)
+    clear_patches()
+    plt.close(fig)
+    return state["apertures"] if state["accepted"] else None
+
+
 def _preview_apertures_blocking(img: np.ndarray,
                                aps: TargetBackgroundApertures,
-                               title: str) -> None:
+                               title: str,
+                               *,
+                               wavelength_controller: Optional[WhiteLightRangeController] = None) -> None:
     """Show apertures overlay in a blocking window (no file write)."""
-    fig, _, _ = _white_light_two_panel(img, title, apertures=aps)
+    fig, _, _ = _white_light_two_panel(
+        img,
+        title,
+        apertures=aps,
+        wavelength_controller=wavelength_controller,
+    )
     plt.show()
     plt.close(fig)
 
@@ -731,132 +1402,24 @@ def _preview_apertures_blocking(img: np.ndarray,
 def review_apertures(img: np.ndarray,
                      apertures: TargetBackgroundApertures,
                      side_label: str,
-                     show: bool = False) -> TargetBackgroundApertures:
-    """Show proposed apertures and allow approval or modification."""
-    aps = apertures
-    while True:
-        _preview_apertures_blocking(img, aps, title=f"{side_label} apertures preview")
-
-        choice = prompt(
-            "Approve apertures? [a=approve, rt=redraw target, st=change target shape, rb=redraw background, sb=change background shape, t=move target, b=move background, p=edit params, q=quit]",
-            "a",
-        ).lower().strip()
-
-        if choice in ("a", "y", "yes", ""):
-            return aps
-
-        if choice == "q":
-            raise SystemExit("User quit during aperture definition.")
-
-        if choice == "rt":
-            try:
-                aps = TargetBackgroundApertures(
-                    target=_draw_shape_by_drag(img, aps.target.shape, title=f"{side_label} redraw TARGET aperture"),
-                    background=aps.background,
-                )
-            except RuntimeError:
-                print("No target aperture drawn; TARGET not changed.")
-            continue
-
-        if choice == "st":
-            new_kind = prompt("New target shape (circle/ellipse/rect/square)", aps.target.shape).lower().strip()
-            try:
-                aps = TargetBackgroundApertures(
-                    target=_draw_shape_by_drag(img, new_kind, title=f"{side_label} change TARGET shape"),
-                    background=aps.background,
-                )
-            except RuntimeError:
-                print("No target aperture drawn; TARGET not changed.")
-            continue
-
-        if choice == "rb":
-            try:
-                aps = TargetBackgroundApertures(
-                    target=aps.target,
-                    background=_draw_shape_by_drag(
-                        img,
-                        aps.background.shape,
-                        title=f"{side_label} redraw BACKGROUND region",
-                        reference_shapes=(aps.target,),
-                    ),
-                )
-            except RuntimeError:
-                print("No background region drawn; BACKGROUND not changed.")
-            continue
-
-        if choice == "sb":
-            new_kind = prompt(
-                "New background shape (auto_ellipse_annulus/auto_circle_annulus/ellipse_annulus/circle_annulus/ellipse/circle/rect)",
-                aps.background.shape,
-            ).lower().strip()
-            try:
-                if new_kind == "auto_ellipse_annulus":
-                    bkg = _auto_background_from_target(aps.target, "ellipse_annulus")
-                    bkg = _drag_move_shape(
-                        img,
-                        bkg,
-                        title=f"{side_label} change BACKGROUND shape",
-                        reference_shapes=(aps.target,),
-                    )
-                elif new_kind == "auto_circle_annulus":
-                    bkg = _auto_background_from_target(aps.target, "circle_annulus")
-                    bkg = _drag_move_shape(
-                        img,
-                        bkg,
-                        title=f"{side_label} change BACKGROUND shape",
-                        reference_shapes=(aps.target,),
-                    )
-                else:
-                    bkg = _draw_shape_by_drag(
-                        img,
-                        new_kind,
-                        title=f"{side_label} change BACKGROUND shape",
-                        reference_shapes=(aps.target,),
-                    )
-                aps = TargetBackgroundApertures(target=aps.target, background=bkg)
-            except RuntimeError:
-                print("No background region drawn; BACKGROUND not changed.")
-            continue
-
-        if choice == "t":
-            try:
-                aps = TargetBackgroundApertures(
-                    target=_drag_move_shape(img, aps.target, title=f"{side_label} move TARGET"),
-                    background=aps.background,
-                )
-            except RuntimeError:
-                print("TARGET not changed.")
-            continue
-
-        if choice == "b":
-            try:
-                aps = TargetBackgroundApertures(
-                    target=aps.target,
-                    background=_drag_move_shape(
-                        img,
-                        aps.background,
-                        title=f"{side_label} move BACKGROUND",
-                        reference_shapes=(aps.target,),
-                    ),
-                )
-            except RuntimeError:
-                print("BACKGROUND not changed.")
-            continue
-
-        if choice == "p":
-            print(f"\n[{side_label}] Edit TARGET parameters")
-            aps_t = prompt_aperture_current(aps.target)
-            print(f"\n[{side_label}] Edit BACKGROUND parameters")
-            aps_b = prompt_aperture_current(aps.background)
-            aps = TargetBackgroundApertures(target=aps_t, background=aps_b)
-            continue
-
-        print("Unrecognized option; please choose a/rt/st/rb/sb/t/b/p/q.")
+                     show: bool = False,
+                     wavelength_controller: Optional[WhiteLightRangeController] = None) -> TargetBackgroundApertures:
+    """Show the unified aperture editor and return only after in-window acceptance."""
+    reviewed = _review_apertures_in_window(
+        img,
+        apertures,
+        title=f"{side_label} aperture editor",
+        wavelength_controller=wavelength_controller,
+    )
+    if reviewed is None:
+        raise RuntimeError("Aperture editor closed without accepting the apertures.")
+    return reviewed
 
 
 def interactive_define_apertures(img: np.ndarray,
                                  side_label: str,
-                                 show: bool = False) -> TargetBackgroundApertures:
+                                 show: bool = False,
+                                 wavelength_controller: Optional[WhiteLightRangeController] = None) -> TargetBackgroundApertures:
     """Interactively define target + background apertures (independent) with iterative recentering.
 
     Workflow
@@ -876,7 +1439,12 @@ def interactive_define_apertures(img: np.ndarray,
     tgt_kind = prompt("Target shape (circle/ellipse/rect/square)", "ellipse").lower().strip()
     while True:
         try:
-            tgt = _draw_shape_by_drag(img, tgt_kind, title=f"{side_label} TARGET aperture")
+            tgt = _draw_shape_by_drag(
+                img,
+                tgt_kind,
+                title=f"{side_label} TARGET aperture",
+                wavelength_controller=wavelength_controller,
+            )
         except RuntimeError as exc:
             print(exc)
             if not prompt("Retry target aperture? (y/n)", "y").lower().startswith("y"):
@@ -894,6 +1462,7 @@ def interactive_define_apertures(img: np.ndarray,
                 bkg,
                 title=f"{side_label} BACKGROUND region",
                 reference_shapes=(tgt,),
+                wavelength_controller=wavelength_controller,
             )
         except RuntimeError:
             print("BACKGROUND not changed.")
@@ -905,6 +1474,7 @@ def interactive_define_apertures(img: np.ndarray,
                 bkg,
                 title=f"{side_label} BACKGROUND region",
                 reference_shapes=(tgt,),
+                wavelength_controller=wavelength_controller,
             )
         except RuntimeError:
             print("BACKGROUND not changed.")
@@ -919,6 +1489,7 @@ def interactive_define_apertures(img: np.ndarray,
                     draw_kind,
                     title=f"{side_label} BACKGROUND region",
                     reference_shapes=(tgt,),
+                    wavelength_controller=wavelength_controller,
                 )
             except RuntimeError as exc:
                 print(exc)
@@ -928,4 +1499,10 @@ def interactive_define_apertures(img: np.ndarray,
             break
 
     aps = TargetBackgroundApertures(target=tgt, background=bkg)
-    return review_apertures(img, aps, side_label=side_label, show=show)
+    return review_apertures(
+        img,
+        aps,
+        side_label=side_label,
+        show=show,
+        wavelength_controller=wavelength_controller,
+    )
