@@ -477,18 +477,43 @@ def plot_o2_correction_diagnostic(
     show: bool,
 ) -> None:
     """Detailed RED telluric diagnostic with full spectrum plus zoomed correction windows."""
-    nwin = max(1, len(o2_windows))
-    fig, axes = plt.subplots(2, nwin + 1, figsize=(4.2 * (nwin + 1), 7), constrained_layout=True)
-    if nwin == 1:
-        axes = np.asarray(axes).reshape(2, 2)
-    ax_full = axes[0, 0]
-    ax_trans = axes[1, 0]
-    zoom_axes = axes[:, 1:].ravel()
+    finite_wavelength = np.isfinite(lam_ref)
+    if not np.any(finite_wavelength):
+        raise ValueError("Cannot plot telluric diagnostic without finite wavelengths")
+    wavelength_min = float(np.min(lam_ref[finite_wavelength]))
+    wavelength_max = float(np.max(lam_ref[finite_wavelength]))
+    active_windows = []
+    for lo, hi in o2_windows:
+        clipped_lo = max(float(lo), wavelength_min)
+        clipped_hi = min(float(hi), wavelength_max)
+        samples = finite_wavelength & (lam_ref >= clipped_lo) & (lam_ref <= clipped_hi)
+        if clipped_lo < clipped_hi and np.any(samples):
+            active_windows.append((clipped_lo, clipped_hi))
+
+    zoom_columns = 3
+    zoom_rows = int(np.ceil(len(active_windows) / zoom_columns))
+    fig = plt.figure(
+        figsize=(15.0, 4.1 + 3.2 * zoom_rows),
+        constrained_layout=True,
+    )
+    grid = fig.add_gridspec(1 + zoom_rows, 6)
+    ax_full = fig.add_subplot(grid[0, :3])
+    ax_trans = fig.add_subplot(grid[0, 3:])
+    zoom_axes = [
+        fig.add_subplot(
+            grid[
+                1 + index // zoom_columns,
+                2 * (index % zoom_columns):2 * (index % zoom_columns) + 2,
+            ]
+        )
+        for index in range(len(active_windows))
+    ]
 
     ax_full.plot(lam_ref, F_before, lw=0.9, alpha=0.65, label="Before telluric corr")
     ax_full.plot(lam_ref, F_after, lw=0.9, alpha=0.9, label="After telluric corr")
-    for lo, hi in o2_windows:
+    for lo, hi in active_windows:
         ax_full.axvspan(lo, hi, alpha=0.15)
+    ax_full.set_xlim(wavelength_min, wavelength_max)
     ax_full.set_xlabel("Wavelength (A)")
     ax_full.set_ylabel(f"Flux ({FLUX_UNIT_LABEL})")
     ax_full.set_title(f"{objname} RED: full spectrum")
@@ -497,15 +522,16 @@ def plot_o2_correction_diagnostic(
     ax_trans.plot(lam_ref, T_std, lw=0.9, label="Standard transmission")
     ax_trans.plot(lam_ref, T_scaled, lw=0.9, label="Airmass-scaled transmission")
     ax_trans.plot(lam_ref, 1.0 / np.clip(T_scaled, 0.02, None), lw=0.9, alpha=0.8, label="Applied correction factor")
-    for lo, hi in o2_windows:
+    for lo, hi in active_windows:
         ax_trans.axvspan(lo, hi, alpha=0.15)
+    ax_trans.set_xlim(wavelength_min, wavelength_max)
     ax_trans.set_xlabel("Wavelength (A)")
     ax_trans.set_ylabel("Transmission / factor")
     ax_trans.set_ylim(0, max(1.2, float(np.nanpercentile(1.0 / np.clip(T_scaled[o2_mask], 0.02, None), 98)) * 1.1) if np.any(o2_mask) else 1.2)
     ax_trans.set_title("Telluric model used")
     ax_trans.legend(fontsize=8)
 
-    for ax, (lo, hi) in zip(zoom_axes, o2_windows):
+    for ax, (lo, hi) in zip(zoom_axes, active_windows):
         m = np.isfinite(lam_ref) & (lam_ref >= lo) & (lam_ref <= hi)
         ax.plot(lam_ref[m], F_before[m], lw=0.9, alpha=0.65, label="Before")
         ax.plot(lam_ref[m], F_after[m], lw=0.9, alpha=0.9, label="After")
@@ -517,9 +543,6 @@ def plot_o2_correction_diagnostic(
         ax.set_ylabel(f"Flux ({FLUX_UNIT_LABEL})")
         ax_t.set_ylabel("T scaled")
         ax.set_title(f"Telluric window {lo:.0f}-{hi:.0f} A")
-
-    for ax in zoom_axes[len(o2_windows):]:
-        ax.axis("off")
 
     outpng = Path(outpng)
     outpng.parent.mkdir(parents=True, exist_ok=True)

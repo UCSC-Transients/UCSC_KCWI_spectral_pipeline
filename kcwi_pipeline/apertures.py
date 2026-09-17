@@ -5,6 +5,8 @@ from typing import Tuple, Optional, Dict
 
 import numpy as np
 import matplotlib.pyplot as plt
+import astropy.units as u
+from astropy.wcs import WCS
 from matplotlib.patches import Ellipse, Rectangle, Circle
 from matplotlib.widgets import Button, RadioButtons, RangeSlider, Slider, TextBox
 from photutils.aperture import (
@@ -250,6 +252,7 @@ def _white_light_two_panel(
     apertures: Optional[TargetBackgroundApertures] = None,
     shapes: Optional[Tuple[ApertureShape, ...]] = None,
     wavelength_controller: Optional[WhiteLightRangeController] = None,
+    celestial_wcs: Optional[WCS] = None,
     right_margin: float = 0.90,
 ):
     """Create a two-panel white-light view.
@@ -299,6 +302,55 @@ def _white_light_two_panel(
         ax_right.set_title(f"White light, y compressed x3{range_suffix}")
 
     update_panel_titles()
+
+    if celestial_wcs is not None:
+        coordinate_text = fig.text(
+            0.025,
+            0.52,
+            "Cursor WCS\nRA   --\nDec  --",
+            ha="left",
+            va="center",
+            family="monospace",
+            fontsize=12,
+            bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.82},
+        )
+
+        def update_cursor_coordinates(event) -> None:
+            if (
+                event.inaxes not in (ax_left, ax_right)
+                or event.xdata is None
+                or event.ydata is None
+            ):
+                return
+            try:
+                sky = celestial_wcs.pixel_to_world(
+                    float(event.xdata),
+                    float(event.ydata),
+                )
+                ra = sky.ra.to_string(
+                    unit=u.hourangle,
+                    sep=":",
+                    precision=2,
+                    pad=True,
+                )
+                dec = sky.dec.to_string(
+                    unit=u.deg,
+                    sep=":",
+                    precision=2,
+                    pad=True,
+                    alwayssign=True,
+                )
+                coordinate_text.set_text(f"Cursor WCS\nRA   {ra}\nDec  {dec}")
+            except (AttributeError, TypeError, ValueError):
+                coordinate_text.set_text("Cursor WCS\nRA   unavailable\nDec  unavailable")
+            fig.canvas.draw_idle()
+
+        coordinate_motion_cid = fig.canvas.mpl_connect(
+            "motion_notify_event",
+            update_cursor_coordinates,
+        )
+        fig._kcwi_coordinate_text = coordinate_text
+        fig._kcwi_coordinate_motion_cid = coordinate_motion_cid
 
     if apertures is not None:
         _add_shape_patch(ax_left, apertures.target, edgecolor="red", lw=2.0)
@@ -580,6 +632,7 @@ def _draw_shape_by_drag(
     *,
     reference_shapes: Tuple[ApertureShape, ...] = (),
     wavelength_controller: Optional[WhiteLightRangeController] = None,
+    celestial_wcs: Optional[WCS] = None,
 ) -> ApertureShape:
     """Create and adjust an aperture shape on either white-light panel."""
     print(f"{title}: click-drag-release to draw, then move/resize. Press a/Enter when done.")
@@ -587,6 +640,7 @@ def _draw_shape_by_drag(
         img,
         title + "\nClick-drag to draw. m=move, e=resize, drag to adjust. a/Enter=accept, r=redraw, q=cancel.",
         wavelength_controller=wavelength_controller,
+        celestial_wcs=celestial_wcs,
     )
     state = {
         "start": None,
@@ -713,6 +767,7 @@ def _drag_move_shape(
     *,
     reference_shapes: Tuple[ApertureShape, ...] = (),
     wavelength_controller: Optional[WhiteLightRangeController] = None,
+    celestial_wcs: Optional[WCS] = None,
 ) -> ApertureShape:
     """Move an existing aperture by dragging on either panel until accepted."""
     print(f"{title}: click-drag the aperture on either panel to move/resize. Press a/Enter when done.")
@@ -720,6 +775,7 @@ def _drag_move_shape(
         img,
         title + "\nm=move, e=resize, drag to adjust. a/Enter=accept, q=cancel.",
         wavelength_controller=wavelength_controller,
+        celestial_wcs=celestial_wcs,
     )
 
     for ax in (ax_left, ax_right):
@@ -1013,12 +1069,14 @@ def _review_apertures_in_window(
     title: str,
     *,
     wavelength_controller: Optional[WhiteLightRangeController] = None,
+    celestial_wcs: Optional[WCS] = None,
 ) -> Optional[TargetBackgroundApertures]:
     """Review and edit both apertures in one self-contained blocking window."""
     fig, ax_left, ax_right = _white_light_two_panel(
         img,
         title,
         wavelength_controller=wavelength_controller,
+        celestial_wcs=celestial_wcs,
         right_margin=0.70,
     )
 
@@ -1099,11 +1157,24 @@ def _review_apertures_in_window(
 
     def set_main_controls_visible(visible: bool) -> None:
         for button in buttons.values():
+            button.set_active(visible)
             button.ax.set_visible(visible)
         for artist in group_artists:
             artist.set_visible(visible)
 
     def clear_modal() -> None:
+        modal_widgets = list(state["modal_widgets"])
+        for widget in modal_widgets:
+            try:
+                widget.disconnect_events()
+            except Exception:
+                pass
+        for widget in modal_widgets:
+            if isinstance(widget, TextBox) and widget.capturekeystrokes:
+                try:
+                    widget.stop_typing()
+                except Exception:
+                    pass
         for axes in state["modal_axes"]:
             try:
                 axes.remove()
@@ -1378,6 +1449,7 @@ def _review_apertures_in_window(
     plt.show()
     for cid in cids:
         fig.canvas.mpl_disconnect(cid)
+    clear_modal()
     clear_patches()
     plt.close(fig)
     return state["apertures"] if state["accepted"] else None
@@ -1403,13 +1475,15 @@ def review_apertures(img: np.ndarray,
                      apertures: TargetBackgroundApertures,
                      side_label: str,
                      show: bool = False,
-                     wavelength_controller: Optional[WhiteLightRangeController] = None) -> TargetBackgroundApertures:
+                     wavelength_controller: Optional[WhiteLightRangeController] = None,
+                     celestial_wcs: Optional[WCS] = None) -> TargetBackgroundApertures:
     """Show the unified aperture editor and return only after in-window acceptance."""
     reviewed = _review_apertures_in_window(
         img,
         apertures,
         title=f"{side_label} aperture editor",
         wavelength_controller=wavelength_controller,
+        celestial_wcs=celestial_wcs,
     )
     if reviewed is None:
         raise RuntimeError("Aperture editor closed without accepting the apertures.")
@@ -1419,7 +1493,8 @@ def review_apertures(img: np.ndarray,
 def interactive_define_apertures(img: np.ndarray,
                                  side_label: str,
                                  show: bool = False,
-                                 wavelength_controller: Optional[WhiteLightRangeController] = None) -> TargetBackgroundApertures:
+                                 wavelength_controller: Optional[WhiteLightRangeController] = None,
+                                 celestial_wcs: Optional[WCS] = None) -> TargetBackgroundApertures:
     """Interactively define target + background apertures (independent) with iterative recentering.
 
     Workflow
@@ -1444,6 +1519,7 @@ def interactive_define_apertures(img: np.ndarray,
                 tgt_kind,
                 title=f"{side_label} TARGET aperture",
                 wavelength_controller=wavelength_controller,
+                celestial_wcs=celestial_wcs,
             )
         except RuntimeError as exc:
             print(exc)
@@ -1463,6 +1539,7 @@ def interactive_define_apertures(img: np.ndarray,
                 title=f"{side_label} BACKGROUND region",
                 reference_shapes=(tgt,),
                 wavelength_controller=wavelength_controller,
+                celestial_wcs=celestial_wcs,
             )
         except RuntimeError:
             print("BACKGROUND not changed.")
@@ -1475,6 +1552,7 @@ def interactive_define_apertures(img: np.ndarray,
                 title=f"{side_label} BACKGROUND region",
                 reference_shapes=(tgt,),
                 wavelength_controller=wavelength_controller,
+                celestial_wcs=celestial_wcs,
             )
         except RuntimeError:
             print("BACKGROUND not changed.")
@@ -1490,6 +1568,7 @@ def interactive_define_apertures(img: np.ndarray,
                     title=f"{side_label} BACKGROUND region",
                     reference_shapes=(tgt,),
                     wavelength_controller=wavelength_controller,
+                    celestial_wcs=celestial_wcs,
                 )
             except RuntimeError as exc:
                 print(exc)
@@ -1505,4 +1584,5 @@ def interactive_define_apertures(img: np.ndarray,
         side_label=side_label,
         show=show,
         wavelength_controller=wavelength_controller,
+        celestial_wcs=celestial_wcs,
     )

@@ -62,27 +62,31 @@ from .utils import prompt, safe_filename
 from .uncertainty import linear_resample_with_uncertainty
 
 
-DEFAULT_SIDE_RANGES = {
-    "BLUE": (3550.0, 5550.0),
-    "RED": (5650.0, 8800.0),
+SIDE_TRIM_PADDING_A = {
+    "BLUE": 300.0,
+    "RED": 450.0,
 }
+WAVELENGTH_RANGES_FILENAME = "wavelength_ranges.json"
 
 FLUX_UNIT_LABEL = "1e-15 erg/s/cm^2/A"
 TELLURIC_WINDOWS = [
-    (5890.0, 5896.0),
     (6270.0, 6330.0),
-    (6860.0, 6935.0),
+    (6860.0, 6950.0),
     (7160.0, 7340.0),
     (7590.0, 7700.0),
     (8120.0, 8350.0),
+    (8900.0, 9260.0),
+    (9265.0, 9630.0),
+    (9635.0, 10000.0),
+    (10700.0, 11000.0),
 ]
 TELLURIC_ALIGNMENT_WINDOWS = [(6860.0, 6935.0), (7590.0, 7700.0)]
-O2_WINDOWS = TELLURIC_WINDOWS
 TELLURIC_MIN_T = 0.02
 TELLURIC_TEMPLATE_SMOOTH_S = 0.001
 TELLURIC_AIRMASS_EXPONENT = 0.55
 TELLURIC_MAX_SHIFT_A = 5.0
 TELLURIC_SHIFT_STEP_A = 0.1
+SPLINE_PLOT_WAVELENGTH_MARGIN_A = 100.0
 BACKGROUND_CLIP_SIGMA = 2.5
 BACKGROUND_CLIP_MAXITERS = 5
 COADD_CLIP_SIGMA = 2.0
@@ -177,15 +181,16 @@ def _normalize_extracted_spectrum_for_product(
     return values_out, sigma_out, exposure_time, keyword, ICUBED_SPECTRUM_UNITS
 
 
-def _side_limits(side: str) -> Tuple[float, float]:
-    return DEFAULT_SIDE_RANGES[side.upper()]
-
-
-def _trim_side_arrays(side: str, lam: np.ndarray, *arrays: Optional[np.ndarray]):
-    lo, hi = _side_limits(side)
+def _trim_side_arrays(
+    side: str,
+    lam: np.ndarray,
+    *arrays: Optional[np.ndarray],
+    wavelength_range: Tuple[float, float],
+):
+    lo, hi = wavelength_range
     mask = np.isfinite(lam) & (lam >= lo) & (lam <= hi)
     if not np.any(mask):
-        raise ValueError(f"No wavelengths for {side} in default range {lo:.0f}-{hi:.0f} A")
+        raise ValueError(f"No wavelengths for {side} in approved range {lo:.1f}-{hi:.1f} A")
     out = [np.asarray(lam)[mask]]
     for arr in arrays:
         out.append(None if arr is None else np.asarray(arr)[mask])
@@ -1541,6 +1546,210 @@ def _project_calib_dir(object_dir: Path, calib_dir: Optional[Path]) -> Path:
     return object_dir / "calibrations"
 
 
+def _wavelength_ranges_path(calib_dir: Path) -> Path:
+    return calib_dir / WAVELENGTH_RANGES_FILENAME
+
+
+def _load_wavelength_ranges(calib_dir: Path) -> Dict[str, object]:
+    path = _wavelength_ranges_path(calib_dir)
+    if not path.exists():
+        return {
+            "schema_version": 1,
+            "setup_policy": "one instrumental setup per project",
+            "ranges": {},
+        }
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not isinstance(data.get("ranges", {}), dict):
+            raise ValueError("top-level value or ranges entry is not an object")
+        return data
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Invalid project wavelength-range file {path}: {exc}") from exc
+
+
+def _save_wavelength_ranges(calib_dir: Path, data: Dict[str, object]) -> None:
+    path = _wavelength_ranges_path(calib_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        temp_path.replace(path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _stored_wavelength_range(
+    wavelength_config: Dict[str, object],
+    side: str,
+) -> Optional[Tuple[float, float]]:
+    entry = wavelength_config.get("ranges", {}).get(side)
+    if not isinstance(entry, dict):
+        return None
+    values = entry.get("approved_range_A")
+    if not isinstance(values, list) or len(values) != 2:
+        return None
+    try:
+        lo, hi = float(values[0]), float(values[1])
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return None
+    return lo, hi
+
+
+def _cube_wavelength_coverage(path: Path) -> Tuple[float, float]:
+    with fits.open(path, memmap=True) as hdul:
+        science_hdu = next(
+            (
+                hdu for hdu in hdul
+                if getattr(hdu, "data", None) is not None
+                and getattr(hdu.data, "ndim", 0) == 3
+            ),
+            None,
+        )
+        if science_hdu is None:
+            raise ValueError(f"No 3D science cube found in {path}")
+        wavelength = get_lambda_axis(science_hdu.header, science_hdu.data.shape)
+    finite = wavelength[np.isfinite(wavelength)]
+    if finite.size == 0:
+        raise ValueError(f"Cube has no finite wavelengths: {path}")
+    return float(np.min(finite)), float(np.max(finite))
+
+
+def _common_wavelength_coverage(files: List[Path], side: str) -> Tuple[float, float]:
+    if not files:
+        raise ValueError(f"No {side} cubes available for wavelength-range selection")
+    coverages = [_cube_wavelength_coverage(path) for path in files]
+    lo = max(bounds[0] for bounds in coverages)
+    hi = min(bounds[1] for bounds in coverages)
+    if hi <= lo:
+        raise ValueError(
+            f"{side} cube wavelength ranges do not overlap across all exposures: {coverages}"
+        )
+    return lo, hi
+
+
+def _validate_wavelength_range(
+    side: str,
+    selected: Tuple[float, float],
+    coverage: Tuple[float, float],
+) -> Tuple[float, float]:
+    lo, hi = float(selected[0]), float(selected[1])
+    available_lo, available_hi = coverage
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        raise ValueError(f"{side} wavelength range must contain finite MIN MAX with MAX > MIN")
+    if lo < available_lo or hi > available_hi:
+        raise ValueError(
+            f"Requested {side} wavelength range {lo:.1f}-{hi:.1f} A lies outside "
+            f"the common cube coverage {available_lo:.1f}-{available_hi:.1f} A"
+        )
+    return lo, hi
+
+
+def _parse_wavelength_range(text: str, side: str) -> Tuple[float, float]:
+    fields = text.replace(":", " ").replace(",", " ").split()
+    if len(fields) != 2:
+        raise ValueError(f"Enter the {side} wavelength range as MIN:MAX, for example 3600:5200")
+    try:
+        return float(fields[0]), float(fields[1])
+    except ValueError as exc:
+        raise ValueError(f"Enter numeric {side} wavelength limits") from exc
+
+
+def _resolve_wavelength_range(
+    object_dir: Path,
+    side: str,
+    files: List[Path],
+    calib_dir: Path,
+    *,
+    standard: bool,
+    override: Optional[Tuple[float, float]],
+) -> Tuple[float, float]:
+    coverage = _common_wavelength_coverage(files, side)
+    padding = SIDE_TRIM_PADDING_A[side]
+    suggestion = (coverage[0] + padding, coverage[1] - padding)
+    suggestion_is_valid = suggestion[1] > suggestion[0]
+
+    config = _load_wavelength_ranges(calib_dir)
+    stored = _stored_wavelength_range(config, side)
+    source = ""
+    if override is not None:
+        approved = _validate_wavelength_range(side, override, coverage)
+        source = "command_line"
+    elif stored is not None:
+        approved = _validate_wavelength_range(side, stored, coverage)
+        source = "saved_project_range"
+        print(
+            f"[{object_dir.name} {side}] Using saved project wavelength range "
+            f"{approved[0]:.1f}-{approved[1]:.1f} A."
+        )
+    elif not standard:
+        raise RuntimeError(
+            f"No approved project wavelength range exists for {side}. Reduce a {side} "
+            f"standard star first, or provide --{side.lower()}-range MIN MAX."
+        )
+    else:
+        if not suggestion_is_valid:
+            raise ValueError(
+                f"{side} common coverage {coverage[0]:.1f}-{coverage[1]:.1f} A is too "
+                f"narrow for the automatic {padding:.0f} A trim on each side. "
+                f"Supply --{side.lower()}-range MIN MAX explicitly."
+            )
+        print(f"\n[{object_dir.name} {side}] Common cube coverage: {coverage[0]:.1f}-{coverage[1]:.1f} A")
+        print(
+            f"[{object_dir.name} {side}] Suggested usable range after trimming "
+            f"{padding:.0f} A from each edge: {suggestion[0]:.1f}-{suggestion[1]:.1f} A"
+        )
+        print(
+            "Inspect the cube and its wavelength-dependent quality when choosing the "
+            "range. Press Enter to accept the suggestion, or enter MIN:MAX."
+        )
+        while True:
+            raw = prompt(
+                f"{side} usable wavelength range (A)",
+                f"{suggestion[0]:.1f}:{suggestion[1]:.1f}",
+            )
+            try:
+                approved = _validate_wavelength_range(
+                    side,
+                    _parse_wavelength_range(raw, side),
+                    coverage,
+                )
+            except ValueError as exc:
+                print(exc)
+                continue
+            break
+        source = "interactive_standard_confirmation"
+
+    if standard and source != "saved_project_range":
+        ranges = config.setdefault("ranges", {})
+        ranges[side] = {
+            "source_standard": object_dir.name,
+            "cube_common_coverage_A": list(coverage),
+            "suggested_range_A": list(suggestion) if suggestion_is_valid else None,
+            "approved_range_A": list(approved),
+            "selection_source": source,
+            "edge_trim_A": padding,
+        }
+        _save_wavelength_ranges(calib_dir, config)
+        print(
+            f"[{object_dir.name} {side}] Saved approved project wavelength range "
+            f"{approved[0]:.1f}-{approved[1]:.1f} A -> {_wavelength_ranges_path(calib_dir)}"
+        )
+    elif override is not None:
+        print(
+            f"[{object_dir.name} {side}] Using command-line wavelength range "
+            f"{approved[0]:.1f}-{approved[1]:.1f} A for this reduction."
+        )
+    return approved
+
+
 def _load_registry(calib_dir: Path) -> Dict[str, object]:
     path = calib_dir / "calibration_registry.json"
     if not path.exists():
@@ -1776,8 +1985,15 @@ def interactive_continuum_spline(
     lam_g = lam[good]
     counts_g = counts[good]
     ref_g = ref_flux[good]
-    excluded_g = _window_mask(lam_g, exclude_windows)
-    continuum_seed = good & ~_window_mask(lam, exclude_windows)
+    wavelength_min = float(np.min(lam_g))
+    wavelength_max = float(np.max(lam_g))
+    active_exclude_windows = [
+        (max(float(lo), wavelength_min), min(float(hi), wavelength_max))
+        for lo, hi in (exclude_windows or [])
+        if float(hi) >= wavelength_min and float(lo) <= wavelength_max
+    ]
+    excluded_g = _window_mask(lam_g, active_exclude_windows)
+    continuum_seed = good & ~_window_mask(lam, active_exclude_windows)
     if np.count_nonzero(continuum_seed) < 8:
         continuum_seed = good
 
@@ -1789,7 +2005,15 @@ def interactive_continuum_spline(
     y_init = np.interp(x_init, x_seed, y_seed)
     default_points: List[Tuple[float, float]] = list(zip(x_init, y_init))
     if initial_points is not None and len(initial_points) >= 2:
-        points = [(float(x), float(y)) for x, y in initial_points if np.isfinite(x) and np.isfinite(y)]
+        points = [
+            (float(x), float(y))
+            for x, y in initial_points
+            if (
+                np.isfinite(x)
+                and np.isfinite(y)
+                and wavelength_min <= float(x) <= wavelength_max
+            )
+        ]
         if len(points) < 2:
             points = list(default_points)
     else:
@@ -1810,14 +2034,18 @@ def interactive_continuum_spline(
         ax_ref.clear()
         ax_sens.clear()
         cont = (
-            _continuum_from_points_excluding_windows(lam_g, points, exclude_windows)
+            _continuum_from_points_excluding_windows(
+                lam_g,
+                points,
+                active_exclude_windows,
+            )
             if len(points) >= 2 else np.full_like(lam_g, np.nan)
         )
         with np.errstate(divide="ignore", invalid="ignore"):
             sens = ref_g / cont
 
         ax_obs.plot(lam_g, counts_g, lw=0.8, color="0.35", label="Extracted standard")
-        for lo, hi in exclude_windows or []:
+        for lo, hi in active_exclude_windows:
             ax_obs.axvspan(lo, hi, alpha=0.16, color="tab:orange")
         if len(points) >= 2:
             ax_obs.plot(lam_g, cont, lw=1.5, color="tab:red", label="Continuum spline")
@@ -1829,7 +2057,10 @@ def interactive_continuum_spline(
         ax_obs.set_title(
             title
             + "\nleft-click add point, drag marker to move, right-click delete, z=zoom box, o=original zoom, a=accept, r=reset, q=quit"
-            + ("\norange telluric windows are excluded from the continuum fit" if exclude_windows else "")
+            + (
+                "\norange telluric windows are excluded from the continuum fit"
+                if active_exclude_windows else ""
+            )
         )
         ax_obs.legend(loc="best")
         ax_obs.grid(alpha=0.2)
@@ -1844,7 +2075,7 @@ def interactive_continuum_spline(
         ax_obs.patch.set_visible(False)
 
         ax_sens.plot(lam_g, sens, lw=1.0, color="tab:green")
-        for lo, hi in exclude_windows or []:
+        for lo, hi in active_exclude_windows:
             ax_sens.axvspan(lo, hi, alpha=0.16, color="tab:orange")
         ax_sens.set_ylabel("Sensitivity")
         ax_sens.set_xlabel("Wavelength (A)")
@@ -1856,6 +2087,10 @@ def interactive_continuum_spline(
                 pad = 0.08 * (yhi - ylo)
                 ax_sens.set_ylim(ylo - pad, yhi + pad)
         if original_view["xlim"] is None:
+            ax_obs.set_xlim(
+                wavelength_min - SPLINE_PLOT_WAVELENGTH_MARGIN_A,
+                wavelength_max + SPLINE_PLOT_WAVELENGTH_MARGIN_A,
+            )
             original_view["xlim"] = ax_obs.get_xlim()
             original_view["obs_ylim"] = ax_obs.get_ylim()
             original_view["sens_ylim"] = ax_sens.get_ylim()
@@ -2008,7 +2243,11 @@ def interactive_continuum_spline(
 
     if not accepted["done"]:
         raise RuntimeError("Continuum spline was not accepted")
-    continuum = _continuum_from_points_excluding_windows(lam, points, exclude_windows)
+    continuum = _continuum_from_points_excluding_windows(
+        lam,
+        points,
+        active_exclude_windows,
+    )
     with np.errstate(divide="ignore", invalid="ignore"):
         sensitivity = ref_flux / continuum
     return continuum, sensitivity, sorted(points, key=lambda item: item[0])
@@ -2148,6 +2387,7 @@ def _extract_side(
     object_dir: Path,
     side: str,
     *,
+    wavelength_range: Tuple[float, float],
     show_plots: bool,
     redo_apertures: bool,
     cr_reject: bool,
@@ -2198,7 +2438,7 @@ def _extract_side(
         if resolving_power_estimate is not None:
             resolving_power_estimates.append(resolving_power_estimate)
         lam = get_lambda_axis(hdr, cube.shape)
-        lo, hi = _side_limits(side)
+        lo, hi = wavelength_range
         white_light_controller = WhiteLightRangeController(
             cube,
             lam,
@@ -2206,6 +2446,13 @@ def _extract_side(
             maximum=hi,
         )
         img = white_light_controller.image()
+        try:
+            aperture_wcs = _celestial_wcs(hdr, exposure_label)
+        except ValueError as exc:
+            aperture_wcs = None
+            print(
+                f"[{exposure_label}] WARNING: RA/Dec cursor readout unavailable: {exc}"
+            )
 
         ap_path = ap_dir / f"{path.stem}_aperture.json"
         use_initial_template = initial_aperture_template is not None and (
@@ -2228,6 +2475,7 @@ def _extract_side(
                 side_label=f"{exposure_label}: proposed current aperture",
                 show=show_plots,
                 wavelength_controller=white_light_controller,
+                celestial_wcs=aperture_wcs,
             )
         elif use_initial_template:
             assert initial_aperture_template is not None
@@ -2249,6 +2497,7 @@ def _extract_side(
                     exposure_label,
                     show=show_plots,
                     wavelength_controller=white_light_controller,
+                    celestial_wcs=aperture_wcs,
                 )
             else:
                 source_name = initial_aperture_template.exposure_path.name
@@ -2277,6 +2526,7 @@ def _extract_side(
                     ),
                     show=show_plots,
                     wavelength_controller=white_light_controller,
+                    celestial_wcs=aperture_wcs,
                 )
         elif ap_path.exists() and not redo_apertures:
             aps = _aperture_from_json(ap_path)
@@ -2286,6 +2536,7 @@ def _extract_side(
                 side_label=f"{exposure_label}: saved first-exposure aperture",
                 show=show_plots,
                 wavelength_controller=white_light_controller,
+                celestial_wcs=aperture_wcs,
             )
         else:
             aps = interactive_define_apertures(
@@ -2293,6 +2544,7 @@ def _extract_side(
                 exposure_label,
                 show=show_plots,
                 wavelength_controller=white_light_controller,
+                celestial_wcs=aperture_wcs,
             )
 
         current_aps = aps
@@ -2328,7 +2580,13 @@ def _extract_side(
                 f"[{exposure_label}] Normalized icubed spectrum and uncertainty "
                 f"by {exposure_time:g} s from {exposure_time_keyword}."
             )
-        lam, counts, sigma = _trim_side_arrays(side, lam, counts, sigma)
+        lam, counts, sigma = _trim_side_arrays(
+            side,
+            lam,
+            counts,
+            sigma,
+            wavelength_range=wavelength_range,
+        )
         spec_path = spectra_dir / f"{path.stem}_counts.flm"
         spectrum_header = "count_rate_e_per_s" if product_type == "icubed" else "native_icubes_flux"
         _save_spectrum(spec_path, lam, counts, sigma, spectrum_header)
@@ -2504,6 +2762,7 @@ def _extract_side(
             ICUBED_SPECTRUM_UNITS if product_type == "icubed" else ICUBES_SPECTRUM_UNITS
         ),
         "exposure_normalized": product_type == "icubed",
+        "wavelength_range_A": list(wavelength_range),
         "spectral_cr_review": spectral_cr_state,
         "exposures": [asdict(item) for item in extracted],
     }
@@ -2553,6 +2812,7 @@ def _find_existing_fluxcal_path(
 def _load_existing_fluxcal_side(
     object_dir: Path,
     side: str,
+    wavelength_range: Optional[Tuple[float, float]] = None,
 ) -> Optional[Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]]:
     path = _find_existing_fluxcal_path(object_dir, side)
     if path is None:
@@ -2562,7 +2822,14 @@ def _load_existing_fluxcal_side(
         print(f"Converting legacy {side} fluxcal file from 1e-16 to 1e-15 units for join reuse: {path}")
         flux = flux * 0.1
         sigma = sigma * 0.1 if sigma is not None else None
-    lam, flux, sigma = _trim_side_arrays(side, lam, flux, sigma)
+    if wavelength_range is not None:
+        lam, flux, sigma = _trim_side_arrays(
+            side,
+            lam,
+            flux,
+            sigma,
+            wavelength_range=wavelength_range,
+        )
     return lam, flux, sigma
 
 
@@ -2640,11 +2907,16 @@ def join_existing_science_sides(
     object_dir: Path,
     *,
     show_plots: bool = False,
+    wavelength_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> None:
     object_dir = object_dir.expanduser().resolve()
     flux_paths: Dict[str, Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]] = {}
     for side in ("BLUE", "RED"):
-        existing = _load_existing_fluxcal_side(object_dir, side)
+        existing = _load_existing_fluxcal_side(
+            object_dir,
+            side,
+            None if wavelength_ranges is None else wavelength_ranges.get(side),
+        )
         if existing is None:
             print(
                 f"No existing {side} flux-calibrated spectrum found at "
@@ -2702,6 +2974,7 @@ def _build_standard_calibrations(
     *,
     show_plots: bool,
     product_type: str,
+    wavelength_ranges: Dict[str, Tuple[float, float]],
 ) -> None:
     standard_name = object_dir.name
     registry = _load_registry(calib_dir)
@@ -2709,7 +2982,14 @@ def _build_standard_calibrations(
 
     for side, counts_path in coadd_paths.items():
         lam_std, counts, sigma_counts = _load_txt_spectrum(counts_path)
-        lam_std, counts, sigma_counts = _trim_side_arrays(side, lam_std, counts, sigma_counts)
+        wavelength_range = wavelength_ranges[side]
+        lam_std, counts, sigma_counts = _trim_side_arrays(
+            side,
+            lam_std,
+            counts,
+            sigma_counts,
+            wavelength_range=wavelength_range,
+        )
         star_id, star_name = _choose_standard_star(standard_name)
         flux_ref = reference_flux(star_id, lam_std, scale_1e15=True)
 
@@ -2735,7 +3015,7 @@ def _build_standard_calibrations(
             flux_ref,
             title=f"{standard_name} {side}: continuum fit for {star_name}",
             show=show_plots,
-            exclude_windows=O2_WINDOWS if side == "RED" else None,
+            exclude_windows=TELLURIC_WINDOWS if side == "RED" else None,
             initial_points=initial_points,
         )
         _save_spline_points([spline_points_path, object_spline_points_path], spline_points)
@@ -2761,7 +3041,7 @@ def _build_standard_calibrations(
             "ab_standard_id": star_id,
             "ab_standard_name": star_name,
             "side": side,
-            "wavelength_range_A": list(_side_limits(side)),
+            "wavelength_range_A": list(wavelength_range),
             "counts_file": str(counts_path),
             "reference_flux_file": str(ref_path),
             "observed_continuum_file": str(continuum_path),
@@ -2787,7 +3067,7 @@ def _build_standard_calibrations(
                 lam_std=lam_std,
                 C_std=counts,
                 continuum_std=continuum,
-                telluric_windows=O2_WINDOWS,
+                telluric_windows=TELLURIC_WINDOWS,
                 min_T=TELLURIC_MIN_T,
                 smooth_s=TELLURIC_TEMPLATE_SMOOTH_S,
             )
@@ -2830,9 +3110,9 @@ def _build_standard_calibrations(
                 np.c_[lam_std, tell_before, tell_after],
                 header="lambda_A  standard_flux_before_telluric  standard_flux_after_telluric",
             )
-            plot_o2_template_diagnostic(lam_std, t_o2, O2_WINDOWS,
+            plot_o2_template_diagnostic(lam_std, t_o2, TELLURIC_WINDOWS,
                                         outdir / "telluric_template_RED.png", show=True)
-            plot_o2_template_diagnostic(lam_std, t_o2, O2_WINDOWS,
+            plot_o2_template_diagnostic(lam_std, t_o2, TELLURIC_WINDOWS,
                                         object_diag_dir / "telluric_template_RED.png", show=False)
             item["telluric_file"] = str(tell_path)
             item["telluric_source"] = "same_spectrophotometric_standard"
@@ -2855,7 +3135,7 @@ def _build_standard_calibrations(
             F_std_cal=flux_cal_std,
             outdir=outdir / "diagnostics",
             show=show_plots,
-            telluric_windows=O2_WINDOWS if side == "RED" else None,
+            telluric_windows=TELLURIC_WINDOWS if side == "RED" else None,
             red_tell_before=tell_before,
             red_tell_after=tell_after,
         )
@@ -2871,7 +3151,7 @@ def _build_standard_calibrations(
             F_std_cal=final_standard_flux,
             outdir=object_diag_dir,
             show=False,
-            telluric_windows=O2_WINDOWS if side == "RED" else None,
+            telluric_windows=TELLURIC_WINDOWS if side == "RED" else None,
             red_tell_before=tell_before,
             red_tell_after=tell_after,
         )
@@ -2884,7 +3164,7 @@ def _build_standard_calibrations(
                 t_o2,
                 t_scaled_std,
                 o2_mask,
-                O2_WINDOWS,
+                TELLURIC_WINDOWS,
                 outdir / "diagnostics" / f"{safe_filename(standard_name)}_RED_telluric_detail.png",
                 show=True,
             )
@@ -2896,7 +3176,7 @@ def _build_standard_calibrations(
                 t_o2,
                 t_scaled_std,
                 o2_mask,
-                O2_WINDOWS,
+                TELLURIC_WINDOWS,
                 object_diag_dir / f"{safe_filename(standard_name)}_RED_telluric_detail.png",
                 show=False,
             )
@@ -2936,6 +3216,7 @@ def _apply_science_calibrations(
     *,
     show_plots: bool,
     product_type: str,
+    wavelength_ranges: Dict[str, Tuple[float, float]],
 ) -> None:
     flux_paths: Dict[str, Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]] = {}
     flux_dir = object_dir / "fluxcal"
@@ -2950,11 +3231,50 @@ def _apply_science_calibrations(
             continue
 
         lam_counts, counts, sigma_counts = _load_txt_spectrum(counts_path)
-        lam_counts, counts, sigma_counts = _trim_side_arrays(side, lam_counts, counts, sigma_counts)
+        wavelength_range = wavelength_ranges[side]
+        lam_counts, counts, sigma_counts = _trim_side_arrays(
+            side,
+            lam_counts,
+            counts,
+            sigma_counts,
+            wavelength_range=wavelength_range,
+        )
         sens_arr = np.loadtxt(cal["sensitivity_file"], comments="#")
         lam_sens = sens_arr[:, 0]
         sens = sens_arr[:, 1]
-        lam_sens, sens = _trim_side_arrays(side, lam_sens, sens)
+        calibration_range_raw = cal.get("wavelength_range_A", wavelength_range)
+        calibration_range = (
+            float(calibration_range_raw[0]),
+            float(calibration_range_raw[1]),
+        )
+        effective_range = (
+            max(wavelength_range[0], calibration_range[0]),
+            min(wavelength_range[1], calibration_range[1]),
+        )
+        if effective_range[1] <= effective_range[0]:
+            raise ValueError(
+                f"Science {side} range {wavelength_range} does not overlap selected "
+                f"standard calibration range {calibration_range}"
+            )
+        if effective_range != wavelength_range:
+            print(
+                f"WARNING: Restricting {side} science calibration to the overlap "
+                f"{effective_range[0]:.1f}-{effective_range[1]:.1f} A with the "
+                "selected standard calibration."
+            )
+            lam_counts, counts, sigma_counts = _trim_side_arrays(
+                side,
+                lam_counts,
+                counts,
+                sigma_counts,
+                wavelength_range=effective_range,
+            )
+        lam_sens, sens = _trim_side_arrays(
+            side,
+            lam_sens,
+            sens,
+            wavelength_range=effective_range,
+        )
         unit_scale = _calibration_flux_unit_scale(cal)
         if unit_scale != 1.0:
             print(
@@ -3036,7 +3356,7 @@ def _apply_science_calibrations(
                     lam_flux,
                     flux_before_telluric,
                     flux,
-                    O2_WINDOWS,
+                    TELLURIC_WINDOWS,
                     flux_dir / f"{object_dir.name}_RED_telluric_correction.png",
                     show=False,
                 )
@@ -3048,7 +3368,7 @@ def _apply_science_calibrations(
                     t_shifted,
                     t_scaled,
                     o2_mask,
-                    O2_WINDOWS,
+                    TELLURIC_WINDOWS,
                     flux_dir / f"{object_dir.name}_RED_telluric_detail.png",
                     show=True,
                 )
@@ -3087,7 +3407,11 @@ def _apply_science_calibrations(
     for side in ("BLUE", "RED"):
         if side in flux_paths:
             continue
-        existing = _load_existing_fluxcal_side(object_dir, side)
+        existing = _load_existing_fluxcal_side(
+            object_dir,
+            side,
+            wavelength_ranges.get(side),
+        )
         if existing is not None:
             flux_paths[side] = existing
             print(
@@ -3132,17 +3456,32 @@ def extract_object(
     spectral_cr_resolving_power: Optional[float] = None,
     spectral_cr_config: Optional[SpectralCRConfig] = None,
     join_only: bool = False,
+    wavelength_overrides: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> None:
     object_dir = object_dir.expanduser().resolve()
     if not object_dir.exists():
         raise FileNotFoundError(object_dir)
+    resolved_calib_dir = _project_calib_dir(object_dir, calib_dir)
+    wavelength_overrides = {
+        str(key).upper(): (float(value[0]), float(value[1]))
+        for key, value in (wavelength_overrides or {}).items()
+    }
 
     if join_only:
         if standard is True:
             raise ValueError("--join-only is only valid for science reductions")
+        wavelength_config = _load_wavelength_ranges(resolved_calib_dir)
+        join_ranges: Dict[str, Tuple[float, float]] = {}
+        for side_name in ("BLUE", "RED"):
+            selected = wavelength_overrides.get(side_name)
+            if selected is None:
+                selected = _stored_wavelength_range(wavelength_config, side_name)
+            if selected is not None:
+                join_ranges[side_name] = selected
         join_existing_science_sides(
             object_dir,
             show_plots=show_plots,
+            wavelength_ranges=join_ranges or None,
         )
         return
 
@@ -3165,10 +3504,12 @@ def extract_object(
         spectral_cr_config = SpectralCRConfig()
 
     product_types = set()
+    files_by_side: Dict[str, List[Path]] = {}
     for side_name in sides:
         detected_type, files = _side_product_files(object_dir, side_name)
         if files:
             product_types.add(detected_type)
+            files_by_side[side_name] = files
     if not product_types:
         raise FileNotFoundError(f"No requested-side *_icubed.fits or *_icubes.fits files found under {object_dir}")
     if len(product_types) != 1:
@@ -3179,6 +3520,17 @@ def extract_object(
     product_type = next(iter(product_types))
     print(f"[{object_dir.name}] Input cube product: *_{product_type}.fits")
 
+    wavelength_ranges: Dict[str, Tuple[float, float]] = {}
+    for side_name, files in files_by_side.items():
+        wavelength_ranges[side_name] = _resolve_wavelength_range(
+            object_dir,
+            side_name,
+            files,
+            resolved_calib_dir,
+            standard=bool(standard),
+            override=wavelength_overrides.get(side_name),
+        )
+
     coadd_paths: Dict[str, Path] = {}
     aperture_template: Optional[_ApertureTemplate] = None
     aperture_template_from_current_run = False
@@ -3186,9 +3538,12 @@ def extract_object(
         opposite_side = "RED" if sides[0] == "BLUE" else "BLUE"
         aperture_template = _saved_aperture_template(object_dir, opposite_side)
     for side_name in sides:
+        if side_name not in files_by_side:
+            continue
         result = _extract_side(
             object_dir,
             side_name,
+            wavelength_range=wavelength_ranges[side_name],
             show_plots=show_plots,
             redo_apertures=redo_apertures,
             cr_reject=cr_reject,
@@ -3212,7 +3567,6 @@ def extract_object(
     if not coadd_paths:
         raise FileNotFoundError(f"No requested-side cube files found under {object_dir}")
 
-    resolved_calib_dir = _project_calib_dir(object_dir, calib_dir)
     if standard:
         _build_standard_calibrations(
             object_dir,
@@ -3220,6 +3574,7 @@ def extract_object(
             resolved_calib_dir,
             show_plots=show_plots,
             product_type=product_type,
+            wavelength_ranges=wavelength_ranges,
         )
     else:
         _apply_science_calibrations(
@@ -3228,4 +3583,5 @@ def extract_object(
             resolved_calib_dir,
             show_plots=show_plots,
             product_type=product_type,
+            wavelength_ranges=wavelength_ranges,
         )

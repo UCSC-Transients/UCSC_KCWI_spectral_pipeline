@@ -12,6 +12,11 @@ Use one cube type throughout a project. The pipeline rejects mixed `icubes` and
 consistently. See [Cube products and exposure time](#cube-products-and-exposure-time)
 for the difference between the two products.
 
+Use only one instrumental setup per side in each project. Do not mix cubes
+taken with different gratings, central wavelengths, slicers, or other wavelength
+setups. A project may contain its matched BLUE and RED sides, but observations
+from different setups belong in separate project directories.
+
 ## Quick start
 
 Run commands from the pipeline repository with a Python environment containing:
@@ -80,13 +85,22 @@ Use `--side both` if reducing both sides together. If
 
 During the run, the pipeline will:
 
-1. Create or reuse cosmic ray (CR)-cleaned cubes.
-2. Ask you to define or approve apertures.
-3. Extract and coadd the exposures.
-4. Ask which built-in flux standard corresponds to the object.
-5. Open the continuum/sensitivity editor.
-6. Save a calibration entry for each completed side.
-7. Build a RED telluric template when processing the RED side.
+1. Report the common wavelength coverage of the standard exposures.
+2. Suggest a usable range and ask you to accept or replace it.
+3. Create or reuse cosmic ray (CR)-cleaned cubes.
+4. Ask you to define or approve apertures.
+5. Extract and coadd the exposures.
+6. Ask which built-in flux standard corresponds to the object.
+7. Open the continuum/sensitivity editor.
+8. Save a calibration entry for each completed side.
+9. Build a RED telluric template when processing the RED side.
+
+The automatic wavelength suggestion removes 300 A from both ends of BLUE cubes
+and 450 A from both ends of RED cubes. Inspect the cube and wavelength-dependent
+data quality before accepting it. Press Enter to accept the suggestion or enter
+new limits as `MIN:MAX`. The approved project ranges are saved in
+`calibrations/wavelength_ranges.json` and reused by later standards and science
+targets.
 
 Calibration products are saved under:
 
@@ -118,17 +132,18 @@ python run_kcwi_reduction.py extract \
 
 For each requested side, the pipeline will:
 
-1. Create or reuse CR-cleaned cubes.
-2. Define, propagate, or review apertures for every exposure.
-3. Extract the 1D spectra and open the coadd review window.
-4. Review CR-like narrow features in the coadd.
-5. Ask which compatible standard calibration to use.
-6. Apply sensitivity calibration and, for RED, review telluric alignment.
-7. Save a side-level flux-calibrated spectrum.
+1. Load the wavelength range approved while reducing the standard star.
+2. Create or reuse CR-cleaned cubes.
+3. Define, propagate, or review apertures for every exposure.
+4. Extract the 1D spectra and open the coadd review window.
+5. Review CR-like narrow features in the coadd.
+6. Ask which compatible standard calibration to use.
+7. Apply sensitivity calibration and, for RED, review telluric alignment.
+8. Save a side-level flux-calibrated spectrum.
 
 When both side-level spectra are available, the pipeline opens the BLUE/RED
-scaling window and then writes a combined spectrum. The sides have no spectral
-overlap; the final file is a wavelength-sorted concatenation of the independently
+scaling window and then writes a combined spectrum. The sides have may not have
+spectral overlap; the final file is a wavelength-sorted concatenation of the independently
 scaled sides.
 
 ### 4. Locate the final products
@@ -166,7 +181,8 @@ The aperture display has two views of the same white-light image:
 - right: vertically compressed for easier visual comparison with sky charts.
 
 Both panels use the same image coordinates. You can draw or drag from either
-panel. Display controls are:
+panel. When the cube contains a valid celestial WCS, the box at the left reports
+the mouse pointer's RA and Dec in sexagesimal notation. Display controls are:
 
 - `Wavelength (A)`: changes the wavelength interval used for the white-light
   image only; extraction still uses the full configured side range;
@@ -190,8 +206,7 @@ Cancel
 ```
 
 Choose a move or resize mode, then drag the aperture in either image panel.
-`Accept` immediately continues the pipeline; there is no additional terminal
-approval prompt.
+`Accept` continues the pipeline.
 
 Keyboard shortcuts in the combined editor are:
 
@@ -377,6 +392,8 @@ python run_kcwi_reduction.py extract /path/to/kcwi_project/objects/SCIENCE_OBJEC
 --spectral-cr-resolving-power R    override header-derived resolving power
 --spectral-cr-sigma S              set the candidate significance threshold
 --spectral-cr-max-lsf-fraction F   set the maximum candidate/LSF width ratio
+--blue-range MIN_A MAX_A           override the BLUE project range
+--red-range MIN_A MAX_A            override the RED project range
 --join-only                        redo only BLUE/RED scaling and concatenation
 ```
 
@@ -400,6 +417,12 @@ objects/OBJECT/
   final/             final spectra, plots, and join scale
   diagnostics/       aperture, CR, coadd, and calibration plots
   extraction_state.json
+```
+
+Project-level approved wavelength limits are stored in:
+
+```text
+calibrations/wavelength_ranges.json
 ```
 
 Spectrum tables use the `.flm` extension. When uncertainty is available, they
@@ -441,7 +464,13 @@ final/STD_OBJECT_RED_standard_processed.flm
 
 - Do not mix `*_icubes.fits` and `*_icubed.fits` in one project or requested
   two-side extraction.
+- Do not mix instrumental or wavelength setups for the same side in one
+  project. Create separate projects for different gratings, central
+  wavelengths, slicers, or other setup changes. Matched BLUE and RED sides may
+  remain together.
 - Build standards from the same cube type as the science data.
+- Reduce a standard for a side before reducing science data on that side so the
+  project wavelength range and sensitivity calibration are available.
 - Aperture propagation between cubes depends on valid celestial WCS metadata.
   If transformation fails or falls outside the field, define the aperture
   normally.
@@ -559,25 +588,33 @@ flux_corrected = flux_uncorrected / T_scaled
 Correction windows are:
 
 ```text
-5890--5896 A
 6270--6330 A
-6860--6935 A
+6860--6950 A
 7160--7340 A
 7590--7700 A
 8120--8350 A
+8900--9260 A
+9265--9630 A
+9635--10000 A
+10700--11000 A
 ```
+
+The two 5 A gaps inside the broad 8900--10000 A water-vapor region are left
+available for continuum anchor points in the interactive spline editor.
 
 Only `6860--6935 A` and `7590--7700 A` are used for the automatic shift
 estimate.
 
 ### Wavelength ranges
 
-Extraction, calibration, plotting, and final products are trimmed to:
+For the first standard reduced on each side, the pipeline measures the common
+wavelength overlap of every exposure and suggests trimming 300 A from each
+BLUE edge or 450 A from each RED edge. The user can accept or replace that suggestion.
+Explicit `--blue-range MIN MAX` and `--red-range MIN MAX` arguments take precedence.
 
-```text
-BLUE: 3550--5550 A
-RED:  5650--8800 A
-```
-
-These defaults are defined by `DEFAULT_SIDE_RANGES` in
-`kcwi_pipeline/object_workflow.py`.
+The approved range is recorded in `calibrations/wavelength_ranges.json`, the
+standard calibration registry, and each object's `extraction_state.json`. It is
+used for white-light aperture images, extraction, coaddition, calibration,
+telluric products, diagnostics, and final spectra. Full input and CR-cleaned
+FITS cubes are retained without spectral trimming, so the project can be rerun
+with a different approved range.
