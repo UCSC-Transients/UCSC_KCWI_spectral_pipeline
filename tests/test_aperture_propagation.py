@@ -136,6 +136,10 @@ def test_extract_both_passes_first_side_aperture_to_second(monkeypatch, tmp_path
 
     monkeypatch.setattr("kcwi_pipeline.object_workflow._extract_side", fake_extract_side)
     monkeypatch.setattr(
+        "kcwi_pipeline.object_workflow._resolve_wavelength_range",
+        lambda *_args, **_kwargs: (4000.0, 8000.0),
+    )
+    monkeypatch.setattr(
         "kcwi_pipeline.object_workflow._apply_science_calibrations",
         lambda *args, **kwargs: None,
     )
@@ -153,3 +157,42 @@ def test_extract_both_passes_first_side_aperture_to_second(monkeypatch, tmp_path
     assert calls[1][1] is not None
     assert calls[1][1].side == "BLUE"
     assert calls[1][2] is True
+
+
+def test_extract_both_skips_a_side_with_no_cubes(monkeypatch, tmp_path) -> None:
+    red_dir = tmp_path / "RED"
+    red_dir.mkdir()
+    (red_dir / "red_icubes.fits").touch()
+    calls = []
+
+    def fake_extract_side(object_dir: Path, side: str, **kwargs) -> _SideExtractionResult:
+        calls.append(side)
+        return _SideExtractionResult(
+            coadd_path=object_dir / f"{side}_coadd.flm",
+            aperture_template=_ApertureTemplate(
+                apertures=_apertures(),
+                header=_celestial_header(),
+                side=side,
+                exposure_path=object_dir / side / f"{side.lower()}_icubes.fits",
+            ),
+        )
+
+    monkeypatch.setattr("kcwi_pipeline.object_workflow._extract_side", fake_extract_side)
+    monkeypatch.setattr(
+        "kcwi_pipeline.object_workflow._resolve_wavelength_range",
+        lambda *_args, **_kwargs: (6000.0, 9000.0),
+    )
+    monkeypatch.setattr(
+        "kcwi_pipeline.object_workflow._apply_science_calibrations",
+        lambda *args, **kwargs: None,
+    )
+
+    extract_object(
+        tmp_path,
+        standard=False,
+        side="both",
+        cr_config=CosmicRayRejectionConfig(workers=1),
+        spectral_cr_review=False,
+    )
+
+    assert calls == ["RED"]

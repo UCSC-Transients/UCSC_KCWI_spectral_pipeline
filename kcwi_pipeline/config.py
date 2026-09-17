@@ -71,12 +71,15 @@ class CalibrationConfig:
     spline_s_init: float = 0.05
     telluric_windows: List[Tuple[float, float]] = field(
         default_factory=lambda: [
-            (5890, 5896),
             (6270, 6330),
-            (6860, 6935),
+            (6860, 6950),
             (7160, 7340),
             (7590, 7700),
             (8120, 8350),
+            (8900, 9260),
+            (9265, 9630),
+            (9635, 10000),
+            (10700, 11000),
         ]
     )
     telluric_template_smooth_s: Optional[float] = 0.001

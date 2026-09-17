@@ -33,6 +33,22 @@ def main() -> None:
         help="Which side to extract",
     )
     p_ext.add_argument("--calib-dir", type=str, default=None, help="Master calibration directory")
+    p_ext.add_argument(
+        "--blue-range",
+        type=float,
+        nargs=2,
+        metavar=("MIN_A", "MAX_A"),
+        default=None,
+        help="Override the approved BLUE wavelength range in Angstroms",
+    )
+    p_ext.add_argument(
+        "--red-range",
+        type=float,
+        nargs=2,
+        metavar=("MIN_A", "MAX_A"),
+        default=None,
+        help="Override the approved RED wavelength range in Angstroms",
+    )
     p_ext.add_argument("--show-plots", action="store_true", help="Show interactive/diagnostic plots")
     p_ext.add_argument("--redo-apertures", action="store_true", help="Ignore saved apertures and redefine them")
     p_ext.add_argument(
@@ -232,6 +248,11 @@ def main() -> None:
             max_lsf_fraction=float(args.spectral_cr_max_lsf_fraction),
         )
         standard = True if args.standard else False if args.science else None
+        wavelength_overrides = {}
+        if args.blue_range is not None:
+            wavelength_overrides["BLUE"] = tuple(args.blue_range)
+        if args.red_range is not None:
+            wavelength_overrides["RED"] = tuple(args.red_range)
         extract_object(
             Path(args.object_dir),
             calib_dir=Path(args.calib_dir) if args.calib_dir else None,
@@ -246,6 +267,7 @@ def main() -> None:
             spectral_cr_resolving_power=args.spectral_cr_resolving_power,
             spectral_cr_config=spectral_cr_config,
             join_only=bool(args.join_only),
+            wavelength_overrides=wavelength_overrides,
         )
         return
 
